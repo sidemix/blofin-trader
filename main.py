@@ -1,19 +1,18 @@
 # main.py
 # BloFin → Discord (Render Worker)
-# Posts ONE compact "Active BloFin Positions" table.
-# Triggers:
-#   • Immediate when a position is opened or closed (set change)
-#   • Every PERIOD_HOURS (default 6h) to show ΔPNL since last periodic post
-# Columns:
-#   SYMBOL | SIDE xLEV | AVG Entry Price | PNL | PNL% | (ΔPNL(6h) on periodic posts)
+# - Table columns: SYMBOL | SIDE xLEV | AVG Entry Price | PNL | PNL%
+# - Triggers:
+#     • immediate on open/close (set change only)
+#     • periodic refresh every PERIOD_HOURS (default 6h)
+# - Ignores add/reduce, mark/liq/entry wiggles between updates.
 
 import os, json, time, hmac, base64, hashlib, asyncio
-from typing import Optional, Dict, Tuple, List
+from typing import Dict, Tuple, List
 
 import websockets
 import httpx
 
-# ---------- ENV ----------
+# ========== ENV ==========
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -27,17 +26,13 @@ DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 
 IS_DEMO = os.getenv("BLOFIN_IS_DEMO", "false").lower() == "true"
 TABLE_TITLE = os.getenv("TABLE_TITLE", "Active BloFin Positions")
-
-# Treat <= EPS size as closed (prevents float jitter)
-SIZE_EPS = float(os.getenv("SIZE_EPS", "0.00000001"))
-# Minimum seconds between two back-to-back posts (anti-burst)
+SIZE_EPS = float(os.getenv("SIZE_EPS", "0.00000001"))      # treat <= EPS as closed
 SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5"))
-# Periodic refresh interval in hours (for ΔPNL)
-PERIOD_HOURS = float(os.getenv("PERIOD_HOURS", "6"))
+PERIOD_HOURS = float(os.getenv("PERIOD_HOURS", "6"))       # set to 0 to disable periodic posts
 
 WS_URL = "wss://demo-trading-openapi.blofin.com/ws/private" if IS_DEMO else "wss://openapi.blofin.com/ws/private"
 
-# ---------- Discord sender (queue + 429) ----------
+# ========== Discord sender (queue + 429) ==========
 SEND_Q: asyncio.Queue = asyncio.Queue()
 
 async def discord_sender():
@@ -52,10 +47,10 @@ async def discord_sender():
                     except Exception:
                         retry_after = 2.0
                     await asyncio.sleep(retry_after)
-                    await SEND_Q.put(content)
+                    await SEND_Q.put(content)  # retry same message
                 else:
                     r.raise_for_status()
-                    await asyncio.sleep(1.1)   # gentle pace ~1 msg/sec
+                    await asyncio.sleep(1.1)
             except Exception:
                 await asyncio.sleep(2.0)
             finally:
@@ -64,7 +59,7 @@ async def discord_sender():
 async def send_text(text: str):
     await SEND_Q.put(text)
 
-# ---------- WS auth/sub ----------
+# ========== WS auth/sub ==========
 def ws_login_payload() -> dict:
     ts = str(int(time.time() * 1000))
     nonce = ts
@@ -85,15 +80,19 @@ def sub_payloads() -> List[dict]:
 def is_push(msg: dict) -> bool:
     return "data" in msg and ("arg" in msg or "action" in msg)
 
-# ---------- Helpers ----------
+# ========== Helpers ==========
 def fnum(x, d=6):
-    try: return f"{float(x):.{d}f}"
-    except: return str(x or "")
+    try:
+        return f"{float(x):.{d}f}"
+    except:
+        return str(x or "")
 
 def parse_size(row: dict) -> float:
     s = row.get("positions") or row.get("pos") or row.get("size") or 0
-    try: return float(s)
-    except: return 0.0
+    try:
+        return float(s)
+    except:
+        return 0.0
 
 def infer_side(row: dict) -> str:
     s = str(row.get("positionSide") or "").lower()
@@ -104,78 +103,53 @@ def infer_side(row: dict) -> str:
     if sz < 0: return "Short"
     return "Buy"
 
-# ---------- State we maintain ----------
+def fmt_signed_pct(ratio) -> str:
+    try:
+        v = float(ratio) * 100.0
+        sign = "+" if v >= 0 else ""
+        return f"{sign}{v:.2f}%"
+    except:
+        return ""
+
+# ========== State ==========
 OpenKey = Tuple[str, str]  # (instId, "Buy"/"Short")
-
-# Latest row we’ve seen per open key (for display)
-LATEST_ROW: Dict[OpenKey, dict] = {}
-# Set of open keys (for structural change detection)
-LAST_OPEN_KEYS: set[OpenKey] = set()
-# PNL baseline for ΔPNL on periodic posts
-PNL_BASELINE: Dict[OpenKey, float] = {}
-
+LATEST_ROW: Dict[OpenKey, dict] = {}    # freshest row for display
+LAST_OPEN_KEYS: set[OpenKey] = set()    # set used to detect open/close
 LAST_POST_TIME: float = 0.0
 
-def extract_open_keys_and_update_cache(rows: List[dict]) -> set[OpenKey]:
-    """Update LATEST_ROW for open positions and return the set of open keys right now."""
+def update_cache_and_keys(rows: List[dict]) -> set[OpenKey]:
     current: set[OpenKey] = set()
     for r in rows:
         if abs(parse_size(r)) <= SIZE_EPS:
             continue
         key = (str(r.get("instId")), infer_side(r))
         current.add(key)
-        LATEST_ROW[key] = r  # keep the freshest row for display
-    # purge cache entries for keys that are no longer open
+        LATEST_ROW[key] = r
+    # purge closed keys from cache
     for k in list(LATEST_ROW.keys()):
         if k not in current:
             del LATEST_ROW[k]
     return current
 
-def format_table(keys: set[OpenKey], include_delta: bool) -> str:
-    # Headers updated per request
+def format_table(keys: set[OpenKey]) -> str:
     headers = ["SYMBOL", "SIDE xLEV", "AVG Entry Price", "PNL", "PNL%"]
-    if include_delta:
-        headers.append("ΔPNL(6h)")
-
     rows: List[List[str]] = []
+
     for key in sorted(keys):
         row = LATEST_ROW.get(key, {})
         inst, side = key
-        lev = row.get("leverage") or ""
-        avg = row.get("entryPrice") or row.get("avgPrice") or row.get("averagePrice") or ""
-        pnl = row.get("unrealizedPnl")
+        lev  = row.get("leverage") or ""
+        avg  = row.get("entryPrice") or row.get("avgPrice") or row.get("averagePrice") or ""
+        pnl  = row.get("unrealizedPnl")
         pnlr = row.get("unrealizedPnlRatio")
 
-        # Format values
         sidelev = f"{side} {fnum(lev,0)}x" if str(lev) not in ("", "0") else side
-        pnl_pct = ""
-        try:
-            pnl_pct = f"{float(pnlr)*100:.2f}%"
-        except Exception:
-            pnl_pct = str(pnlr or "")
-
-        rec = [inst, sidelev, fnum(avg,6), fnum(pnl,6), pnl_pct]
-
-        if include_delta:
-            base = PNL_BASELINE.get(key, None)
-            try:
-                cur = float(pnl) if pnl not in (None, "") else 0.0
-            except:
-                cur = 0.0
-            if base is None:
-                delta_str = "—"
-            else:
-                d = cur - base
-                sign = "+" if d >= 0 else ""
-                delta_str = f"{sign}{d:.6f}"
-            rec.append(delta_str)
-
-        rows.append(rec)
+        rows.append([inst, sidelev, fnum(avg,6), fnum(pnl,6), fmt_signed_pct(pnlr)])
 
     # widths
     cols = list(zip(*([headers] + rows))) if rows else [headers]
     widths = [max(len(str(x)) for x in col) for col in cols] if rows else [len(h) for h in headers]
-    def fmt_row(row): return "  ".join(str(v).ljust(w) for v, w in zip(row, widths))
+    def fmt_row(r): return "  ".join(str(v).ljust(w) for v, w in zip(r, widths))
 
     lines = [f"**{TABLE_TITLE}**", "```", fmt_row(headers), fmt_row(["-"*w for w in widths])]
     if rows:
@@ -186,39 +160,29 @@ def format_table(keys: set[OpenKey], include_delta: bool) -> str:
     lines.append("```")
     return "\n".join(lines)
 
-async def post_table(keys: set[OpenKey], include_delta: bool, force: bool = False):
+async def post_table(keys: set[OpenKey], force: bool = False):
     global LAST_POST_TIME
     now = time.time()
     if not force and (now - LAST_POST_TIME) < SEND_MIN_INTERVAL:
         return
-    text = format_table(keys, include_delta=include_delta)
-    await send_text(text)
+    await send_text(format_table(keys))
     LAST_POST_TIME = now
 
-# ---------- Background periodic task ----------
-async def periodic_pnl_updates():
-    """Every PERIOD_HOURS, post a table with ΔPNL and refresh the baseline."""
-    global PNL_BASELINE
-    await asyncio.sleep(10)  # allow initial cache fill
-    interval = max(0.1, PERIOD_HOURS) * 3600.0
+# ========== Periodic task (every PERIOD_HOURS) ==========
+async def periodic_refresh():
+    if PERIOD_HOURS <= 0:
+        return
+    await asyncio.sleep(10)  # allow initial cache to populate
+    interval = PERIOD_HOURS * 3600.0
     while True:
         keys_now = set(LATEST_ROW.keys())
-        await post_table(keys_now, include_delta=True, force=True)
-        # Refresh ΔPNL baselines
-        new_baseline: Dict[OpenKey, float] = {}
-        for k in keys_now:
-            pnl = LATEST_ROW.get(k, {}).get("unrealizedPnl")
-            try:
-                new_baseline[k] = float(pnl) if pnl not in (None, "") else 0.0
-            except:
-                new_baseline[k] = 0.0
-        PNL_BASELINE = new_baseline
+        await post_table(keys_now, force=True)
         await asyncio.sleep(interval)
 
-# ---------- Main loop ----------
+# ========== Main ==========
 async def run():
     asyncio.create_task(discord_sender())
-    asyncio.create_task(periodic_pnl_updates())
+    asyncio.create_task(periodic_refresh())
 
     global LAST_OPEN_KEYS
     backoff = 1
@@ -251,11 +215,11 @@ async def run():
                         continue
 
                     rows = msg.get("data", [])
-                    keys_now = extract_open_keys_and_update_cache(rows)
+                    keys_now = update_cache_and_keys(rows)
 
-                    # Post only on open/close (set change)
+                    # Only open/close triggers an immediate post
                     if (not first_sent) or (keys_now != LAST_OPEN_KEYS):
-                        await post_table(keys_now, include_delta=True, force=True)
+                        await post_table(keys_now, force=True)
                         LAST_OPEN_KEYS = keys_now
                         first_sent = True
 
