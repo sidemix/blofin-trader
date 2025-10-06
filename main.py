@@ -1,9 +1,8 @@
 # main.py
 # BloFin → Discord (Render Worker)
-# Posts ONE "Active BloFin Positions" table only when structure changes:
-# - position opened/closed
-# - size changes (by instId + positionSide)
-# Ignores mark/uPnL/liq/entry noise. Max one post every SEND_MIN_INTERVAL seconds.
+# Posts ONE compact "Active Positions" table ONLY when a trade is opened or closed.
+# Shows: SYMBOL, Buy/Short + Leverage, AVG, uPNL
+# Ignores all other changes (size adds/reduces, mark, liq, etc.).
 
 import os, json, time, hmac, base64, hashlib, asyncio
 from typing import Optional, Dict, Tuple, List
@@ -25,11 +24,8 @@ DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
 
 IS_DEMO = os.getenv("BLOFIN_IS_DEMO", "false").lower() == "true"
 TABLE_TITLE = os.getenv("TABLE_TITLE", "Active BloFin Positions")
-
-# Only trigger on SIZE changes > EPS (prevents float jitter)
-SIZE_EPS = float(os.getenv("SIZE_EPS", "0.00000001"))  # 1e-8
-# Don’t post more often than this (seconds)
-SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5"))
+SIZE_EPS = float(os.getenv("SIZE_EPS", "0.00000001"))          # treat <= EPS as closed
+SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5")) # basic anti-burst
 
 WS_URL = "wss://demo-trading-openapi.blofin.com/ws/private" if IS_DEMO else "wss://openapi.blofin.com/ws/private"
 
@@ -40,19 +36,18 @@ async def discord_sender():
     async with httpx.AsyncClient(timeout=15) as client:
         while True:
             content = await SEND_Q.get()
-            payload = {"content": content}
             try:
-                r = await client.post(DISCORD_WEBHOOK, json=payload)
+                r = await client.post(DISCORD_WEBHOOK, json={"content": content})
                 if r.status_code == 429:
                     try:
                         retry_after = float(r.json().get("retry_after", 2.0))
                     except Exception:
                         retry_after = 2.0
                     await asyncio.sleep(retry_after)
-                    await SEND_Q.put(content)
+                    await SEND_Q.put(content)   # retry same message
                 else:
                     r.raise_for_status()
-                    await asyncio.sleep(1.1)  # gentle pacing
+                    await asyncio.sleep(1.1)    # gentle pacing
             except Exception:
                 await asyncio.sleep(2.0)
             finally:
@@ -82,70 +77,70 @@ def sub_payloads() -> List[dict]:
 def is_push(msg: dict) -> bool:
     return "data" in msg and ("arg" in msg or "action" in msg)
 
-# ---------- Snapshot & table ----------
-PosKey = Tuple[str, str]  # (instId, posSide)
-# We track ONLY size (float) per key; structure changes = key add/remove or size delta > EPS
-LAST_SIZES: Dict[PosKey, float] = {}
-LAST_POST_TIME: float = 0.0
-
+# ---------- Helpers ----------
 def fnum(x, d=6):
     try: return f"{float(x):.{d}f}"
     except: return str(x or "")
 
-def parse_size(r: dict) -> float:
-    s = r.get("positions") or r.get("pos") or r.get("size") or 0
+def parse_size(row: dict) -> float:
+    s = row.get("positions") or row.get("pos") or row.get("size") or 0
     try: return float(s)
     except: return 0.0
 
-def build_current_sizes(rows: List[dict]) -> Dict[PosKey, float]:
-    m: Dict[PosKey, float] = {}
+def infer_side(row: dict) -> str:
+    # Prefer explicit side if provided
+    s = str(row.get("positionSide") or "").lower()
+    if s in ("long", "buy"):
+        return "Buy"
+    if s in ("short", "sell"):
+        return "Short"
+    # Fallback: sign of size
+    sz = parse_size(row)
+    if sz > 0:  return "Buy"
+    if sz < 0:  return "Short"
+    return "Buy"  # default when unknown (won't matter for closed)
+
+# ---------- Open-set tracking ----------
+# Key is (instId, normalizedSide "Buy"/"Short")
+OpenKey = Tuple[str, str]
+LAST_OPEN_KEYS: set[OpenKey] = set()
+LAST_POST_TIME: float = 0.0
+
+def current_open_keys(rows: List[dict]) -> set[OpenKey]:
+    keys: set[OpenKey] = set()
     for r in rows:
-        inst = str(r.get("instId"))
-        side = str(r.get("positionSide", "net"))
         sz = parse_size(r)
         if abs(sz) <= SIZE_EPS:
-            continue  # treat ~0 as closed
-        m[(inst, side)] = sz
-    return m
+            continue
+        inst = str(r.get("instId"))
+        side = infer_side(r)
+        keys.add((inst, side))
+    return keys
 
-def needs_update(current: Dict[PosKey, float]) -> bool:
-    # Any added/removed keys?
-    if set(current.keys()) != set(LAST_SIZES.keys()):
-        return True
-    # Any size changed beyond EPS?
-    for k, v in current.items():
-        if k not in LAST_SIZES:  # handled by keys check, but keep safe
-            return True
-        if abs((LAST_SIZES[k] or 0.0) - (v or 0.0)) > SIZE_EPS:
-            return True
-    return False
-
-def format_table(current: Dict[PosKey, float], sample_rows: List[dict]) -> str:
-    # Map latest row per key for display-only MARK/PNL columns
-    latest: Dict[PosKey, dict] = {}
-    for r in sample_rows:
-        key = (str(r.get("instId")), str(r.get("positionSide","net")))
+def format_table(rows: List[dict]) -> str:
+    # Keep only one latest row per (inst, side) for display values
+    latest: Dict[OpenKey, dict] = {}
+    for r in rows:
+        sz = parse_size(r)
+        if abs(sz) <= SIZE_EPS:  # skip closed entries
+            continue
+        key = (str(r.get("instId")), infer_side(r))
         latest[key] = r
 
-    headers = ["SYMBOL", "SIDE", "SIZE", "ENTRY", "MARK", "PNL", "PNL%"]
+    headers = ["SYMBOL", "SIDE xLEV", "AVG", "PNL"]
     data_rows: List[List[str]] = []
 
-    for (inst, side) in sorted(current.keys()):
-        row = latest.get((inst, side), {})
-        size = fnum(current[(inst, side)], 6)
-        entry = row.get("entryPrice") or row.get("avgPrice") or row.get("averagePrice") or ""
-        mark  = row.get("markPrice")
-        pnl   = row.get("unrealizedPnl")
-        pnlr  = row.get("unrealizedPnlRatio")
-        pnlp  = ""
-        try: pnlp = f"{float(pnlr)*100:.2f}%"
-        except: pnlp = str(pnlr or "")
-        data_rows.append([inst, side, size, fnum(entry, 6), fnum(mark, 6), fnum(pnl, 6), pnlp])
+    for (inst, side) in sorted(latest.keys()):
+        r = latest[(inst, side)]
+        lev = r.get("leverage") or ""
+        avg = r.get("entryPrice") or r.get("avgPrice") or r.get("averagePrice") or ""
+        pnl = r.get("unrealizedPnl")
+        side_lev = f"{side} {fnum(lev, 0)}x" if str(lev) not in ("", "0") else side
+        data_rows.append([inst, side_lev, fnum(avg, 6), fnum(pnl, 6)])
 
-    # Column widths
+    # widths
     cols = list(zip(*([headers] + data_rows))) if data_rows else [headers]
     widths = [max(len(str(x)) for x in col) for col in cols] if data_rows else [len(h) for h in headers]
-
     def fmt_row(row): return "  ".join(str(v).ljust(w) for v, w in zip(row, widths))
 
     lines = [f"**{TABLE_TITLE}**", "```", fmt_row(headers), fmt_row(["-"*w for w in widths])]
@@ -157,12 +152,11 @@ def format_table(current: Dict[PosKey, float], sample_rows: List[dict]) -> str:
     lines.append("```")
     return "\n".join(lines)
 
-# ---------- Main loop ----------
+# ---------- Main ----------
 async def run():
     asyncio.create_task(discord_sender())
 
-    global LAST_SIZES, LAST_POST_TIME
-
+    global LAST_OPEN_KEYS, LAST_POST_TIME
     backoff = 1
     first_sent = False
 
@@ -179,6 +173,7 @@ async def run():
                 for sub in sub_payloads():
                     await ws.send(json.dumps(sub))
 
+                # updates
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
@@ -187,21 +182,20 @@ async def run():
 
                     if msg.get("event") in ("subscribe","unsubscribe","info","pong","welcome"):
                         continue
-                    if msg.get("event") == "error" or not is_push(msg):
+                    if not is_push(msg):
                         continue
-
                     if msg.get("arg", {}).get("channel") != "positions":
                         continue
 
                     rows = msg.get("data", [])
-                    current = build_current_sizes(rows)
+                    keys_now = current_open_keys(rows)
 
-                    # Only post when structural change AND rate limit interval passed
-                    if (not first_sent) or needs_update(current):
+                    # Only post on open/close (set change), with a small rate cap
+                    if (not first_sent) or (keys_now != LAST_OPEN_KEYS):
                         now = time.time()
                         if not first_sent or (now - LAST_POST_TIME) >= SEND_MIN_INTERVAL:
-                            LAST_SIZES = current
-                            table = format_table(current, rows)
+                            LAST_OPEN_KEYS = keys_now
+                            table = format_table(rows)
                             await send_text(table)
                             LAST_POST_TIME = now
                             first_sent = True
