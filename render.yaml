@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: blofin-to-discord
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -u main.py"
+    autoDeploy: true
