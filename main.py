@@ -169,15 +169,25 @@ async def post_table(keys: set[OpenKey], force: bool = False):
     LAST_POST_TIME = now
 
 # ========== Periodic task (every PERIOD_HOURS) ==========
+
 async def periodic_refresh():
     if PERIOD_HOURS <= 0:
         return
-    await asyncio.sleep(10)  # allow initial cache to populate
     interval = PERIOD_HOURS * 3600.0
+
+    # Wait a full period before the first periodic post
+    # so startup doesn't immediately double-post.
+    await asyncio.sleep(interval)
+
     while True:
         keys_now = set(LATEST_ROW.keys())
-        await post_table(keys_now, force=True)
+
+        # Debounce: skip if we posted in the last 60s (e.g., an open/close just happened)
+        if time.time() - LAST_POST_TIME >= 60:
+            await post_table(keys_now, force=True)
+
         await asyncio.sleep(interval)
+
 
 # ========== Main ==========
 async def run():
