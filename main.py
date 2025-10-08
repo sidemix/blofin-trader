@@ -1,12 +1,14 @@
 # main.py
 # BloFin → Discord (+ Notion)
-# - Keeps your original Discord behavior (table + new/closed alerts).
-# - Adds Notion upsert on open/close and periodic mark updates.
+# - Discord: table + 🟢 New / 🔴 Closed alerts (same format you liked)
+# - Notion: upsert on open, close on closed, periodic mark updates
+# - NEW: BloFin app-level heartbeat {"op":"ping"} to prevent 1000 closes
 
 import os, json, time, hmac, base64, hashlib, asyncio
 from typing import Dict, Tuple, List, Optional
 
 import websockets
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 import httpx
 
 # ========== ENV ==========
@@ -26,9 +28,12 @@ WEBHOOK_ALERTS = os.getenv("DISCORD_WEBHOOK_ALERTS") or os.environ["DISCORD_WEBH
 
 IS_DEMO      = os.getenv("BLOFIN_IS_DEMO", "false").lower() == "true"
 TABLE_TITLE  = os.getenv("TABLE_TITLE", "Active BloFin Positions")
-SIZE_EPS     = float(os.getenv("SIZE_EPS", "0.00000001"))  # treat <= EPS as closed
+SIZE_EPS     = float(os.getenv("SIZE_EPS", "0.00000001"))
 SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5"))
-PERIOD_HOURS = float(os.getenv("PERIOD_HOURS", "6"))       # 0 = disable periodic
+PERIOD_HOURS = float(os.getenv("PERIOD_HOURS", "6"))  # 0 = disable periodic
+
+# NEW: app-level WS heartbeat (seconds)
+HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "15"))
 
 WS_URL = (
     "wss://demo-trading-openapi.blofin.com/ws/private"
@@ -39,10 +44,9 @@ WS_URL = (
 # ---------- Notion ENV ----------
 NOTION_TOKEN = os.getenv("NOTION_API_TOKEN")
 NOTION_DB_ID = os.getenv("NOTION_DATABASE_ID")
-
 N_VER = os.getenv("NOTION_VERSION", "2022-06-28")
 
-# property names (match your DB)
+# property names (map to your DB)
 N_TITLE       = os.getenv("NOTION_PROP_TITLE", "Trade Name")
 N_STATUS      = os.getenv("NOTION_PROP_STATUS", "Status")
 N_DIR         = os.getenv("NOTION_PROP_DIRECTION", "Direction")
@@ -72,10 +76,10 @@ async def discord_sender():
                     except Exception:
                         retry_after = 2.0
                     await asyncio.sleep(retry_after)
-                    await SEND_Q.put((url, content))  # retry same message
+                    await SEND_Q.put((url, content))
                 else:
                     r.raise_for_status()
-                    await asyncio.sleep(1.1)         # gentle pacing
+                    await asyncio.sleep(1.1)
             except Exception:
                 await asyncio.sleep(2.0)
             finally:
@@ -103,7 +107,6 @@ def ws_login_payload() -> dict:
     }]}
 
 def sub_payloads() -> List[dict]:
-    # Positions channel covers open/close + uPnL updates
     return [{"op": "subscribe", "args": [{"channel": "positions"}]}]
 
 def is_push(msg: dict) -> bool:
@@ -145,11 +148,11 @@ def now_iso() -> str:
 
 # ========== State ==========
 OpenKey = Tuple[str, str]  # (instId, "Buy"/"Short")
-LATEST_ROW: Dict[OpenKey, dict] = {}    # freshest row for each open key (for display & Notion)
-LAST_OPEN_KEYS: set[OpenKey] = set()    # set we compare to detect open/close
+LATEST_ROW: Dict[OpenKey, dict] = {}    # freshest row for each open key
+LAST_OPEN_KEYS: set[OpenKey] = set()    # for open/close detection
 LAST_POST_TIME: float = 0.0
 
-# cache: open-page id per key for quicker Notion updates
+# cache: Notion page id per open position
 OPEN_PAGE_IDS: Dict[OpenKey, str] = {}
 
 def keys_from_rows(rows: List[dict]) -> set[OpenKey]:
@@ -159,10 +162,9 @@ def keys_from_rows(rows: List[dict]) -> set[OpenKey]:
             continue
         k = (str(r.get("instId")), infer_side(r))
         keys.add(k)
-        LATEST_ROW[k] = r  # refresh cache for display/Notion
+        LATEST_ROW[k] = r
     return keys
 
-# normalize row accessors (handle naming variants)
 def row_entry_price(r: dict) -> Optional[float]:
     for k in ("entryPrice", "avgPrice", "averagePrice", "avgEntryPrice"):
         v = r.get(k)
@@ -263,22 +265,21 @@ def n_select(name: Optional[str]): return {"select": ({"name": name} if name els
 def n_date_iso(iso: Optional[str]): return {"date": ({"start": iso} if iso else None)}
 
 def pick(props: dict, name: str, val: dict):
-    # only include properties that exist in DB (schema gate)
     if name in N_SCHEMA_PROPS:
         props[name] = val
 
 async def load_db_schema(client: httpx.AsyncClient):
     if not have_notion(): return
-    r = await client.get(f"https://api.notion.com/v1/databases/{NOTION_DB_ID}",
-                         headers={"Authorization": f"Bearer {NOTION_TOKEN}",
-                                  "Notion-Version": N_VER})
+    r = await client.get(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}",
+        headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": N_VER}
+    )
     r.raise_for_status()
     data = r.json()
     N_SCHEMA_PROPS.clear()
     N_SCHEMA_PROPS.update(list(data.get("properties", {}).keys()))
 
 async def notion_query_open_page(client: httpx.AsyncClient, inst: str, side: str) -> Optional[str]:
-    # filter by Title + Status + Direction
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
     filt = {
         "and": [
@@ -301,7 +302,6 @@ async def notion_query_open_page(client: httpx.AsyncClient, inst: str, side: str
 
 async def notion_upsert_open(client: httpx.AsyncClient, k: OpenKey, r: dict) -> str:
     inst, side = k
-    # mark/qty/entry/lev
     entry = row_entry_price(r)
     qty   = row_qty(r)
     lev   = row_leverage(r)
@@ -347,14 +347,13 @@ async def notion_close_page(client: httpx.AsyncClient, k: OpenKey, last_row: dic
     if not page_id:
         page_id = await notion_query_open_page(client, inst, side)
         if not page_id:
-            return  # nothing to do
+            return
 
-    # Use last seen mark as Exit Price
     exitp = row_mark(last_row) or row_entry_price(last_row)
     props = {}
     pick(props, N_STATUS, n_select(N_STATUS_CLOSED))
     pick(props, N_EXIT, n_num(exitp))
-    pick(props, N_MARK, n_num(None))  # clear mark on closed row (optional)
+    pick(props, N_MARK, n_num(None))
     pick(props, N_DATE_CLOSE, n_date_iso(now_iso()))
 
     r = await client.patch(
@@ -363,16 +362,14 @@ async def notion_close_page(client: httpx.AsyncClient, k: OpenKey, last_row: dic
         json={"properties": props},
     )
     r.raise_for_status()
-    # drop from local map
     if k in OPEN_PAGE_IDS:
         del OPEN_PAGE_IDS[k]
 
 async def notion_refresh_marks(client: httpx.AsyncClient, keys: set[OpenKey]):
-    # Update Market Price for all open rows (periodic)
     if not have_notion(): return
     for k in keys:
         page_id = OPEN_PAGE_IDS.get(k) or await notion_query_open_page(client, k[0], k[1])
-        if not page_id:  # skip if not found
+        if not page_id:
             continue
         r = LATEST_ROW.get(k, {})
         mark = row_mark(r)
@@ -388,7 +385,6 @@ async def notion_refresh_marks(client: httpx.AsyncClient, keys: set[OpenKey]):
             )
             resp.raise_for_status()
         except Exception:
-            # keep going; Notion may transiently error
             await asyncio.sleep(0.2)
 
 # ========== Periodic table refresh ==========
@@ -396,21 +392,30 @@ async def periodic_refresh(notion_client: Optional[httpx.AsyncClient]):
     if PERIOD_HOURS <= 0:
         return
     interval = PERIOD_HOURS * 3600.0
-    await asyncio.sleep(interval)  # delay first to avoid spam at startup
+    await asyncio.sleep(interval)
 
     while True:
         keys_now = set(LATEST_ROW.keys())
-        # If we posted in last 60s due to open/close, skip Discord table
         if time.time() - LAST_POST_TIME >= 60:
             await post_table(keys_now, force=True)
-        # Notion mark refresh
         if have_notion() and notion_client is not None:
             await notion_refresh_marks(notion_client, keys_now)
         await asyncio.sleep(interval)
 
+# ========== Heartbeat ==========
+async def ws_heartbeat(ws: websockets.WebSocketClientProtocol, stop_evt: asyncio.Event):
+    # BloFin expects an application-level heartbeat like {"op":"ping"}
+    # Send every HEARTBEAT_SEC seconds until stop_evt is set
+    while not stop_evt.is_set():
+        try:
+            await ws.send(json.dumps({"op": "ping"}))
+        except Exception:
+            # let the main loop handle reconnect
+            return
+        await asyncio.sleep(HEARTBEAT_SEC)
+
 # ========== Main ==========
 async def run():
-    # shared HTTP client for Notion
     notion_client: Optional[httpx.AsyncClient] = None
     if have_notion():
         notion_client = httpx.AsyncClient(timeout=20)
@@ -430,8 +435,9 @@ async def run():
     while True:
         try:
             print(f"Connecting to BloFin WS… ({WS_URL})")
+            # IMPORTANT: disable library-level pings; we do app-level ping
             async with websockets.connect(
-                WS_URL, ping_interval=20, ping_timeout=20, max_size=5_000_000
+                WS_URL, ping_interval=None, ping_timeout=None, max_size=5_000_000
             ) as ws:
                 # login
                 await ws.send(json.dumps(ws_login_payload()))
@@ -444,65 +450,84 @@ async def run():
                     await ws.send(json.dumps(sub))
                 print("✅ Connected & subscribed (orders/positions).")
 
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
+                # start heartbeat
+                stop_hb = asyncio.Event()
+                hb_task = asyncio.create_task(ws_heartbeat(ws, stop_hb))
 
-                    if msg.get("event") in ("subscribe","unsubscribe","info","pong","welcome"):
-                        continue
-                    if not is_push(msg):
-                        continue
-                    if msg.get("arg", {}).get("channel") != "positions":
-                        continue
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
 
-                    rows = msg.get("data", [])
+                        # ignore non-data frames
+                        if msg.get("event") in ("subscribe","unsubscribe","info","pong","welcome"):
+                            continue
+                        if msg.get("op") in ("pong",):  # some servers reply as {"op":"pong"}
+                            continue
 
-                    # Build new set
-                    keys_now = keys_from_rows(rows)
+                        if not is_push(msg):
+                            continue
+                        if msg.get("arg", {}).get("channel") != "positions":
+                            continue
 
-                    # Detect opens/closes
-                    added = sorted(list(keys_now - LAST_OPEN_KEYS))
-                    removed = sorted(list(LAST_OPEN_KEYS - keys_now))
+                        rows = msg.get("data", [])
+                        keys_now = keys_from_rows(rows)
 
-                    # Notion upserts first (so Discord table reflects DB state)
-                    if have_notion() and notion_client is not None:
-                        for k in added:
-                            try:
-                                await notion_upsert_open(notion_client, k, LATEST_ROW.get(k, {}))
-                            except Exception as e:
-                                print(f"Notion upsert open failed {k}: {e}")
-                        for k in removed:
-                            # use last known row for exit/mark capture
-                            last_row = LATEST_ROW.get(k, {})
-                            try:
-                                await notion_close_page(notion_client, k, last_row)
-                            except Exception as e:
-                                print(f"Notion close failed {k}: {e}")
+                        added = sorted(list(keys_now - LAST_OPEN_KEYS))
+                        removed = sorted(list(LAST_OPEN_KEYS - keys_now))
 
-                    # Post alerts (skip on very first snapshot so we don't alert old positions)
-                    if first_sent:
-                        if added:
-                            await send_alert(alert_block("🟢 New Trades", added))
-                        if removed:
-                            await send_alert(alert_block("🔴 Closed Trades", removed))
-                            # after informing, purge cache for closed
+                        # Notion updates
+                        if have_notion() and notion_client is not None:
+                            for k in added:
+                                try:
+                                    await notion_upsert_open(notion_client, k, LATEST_ROW.get(k, {}))
+                                except Exception as e:
+                                    print(f"Notion upsert open failed {k}: {e}")
                             for k in removed:
-                                if k in LATEST_ROW:
-                                    del LATEST_ROW[k]
-                    # Post table when set changes or at first snapshot
-                    if (not first_sent) or added or removed:
-                        await post_table(keys_now, force=True)
-                        LAST_OPEN_KEYS = keys_now
-                        first_sent = True
+                                last_row = LATEST_ROW.get(k, {})
+                                try:
+                                    await notion_close_page(notion_client, k, last_row)
+                                except Exception as e:
+                                    print(f"Notion close failed {k}: {e}")
 
+                        # Discord alerts
+                        if first_sent:
+                            if added:
+                                await send_alert(alert_block("🟢 New Trades", added))
+                            if removed:
+                                await send_alert(alert_block("🔴 Closed Trades", removed))
+                                for k in removed:
+                                    if k in LATEST_ROW:
+                                        del LATEST_ROW[k]
+
+                        # Table when set changes or first snapshot
+                        if (not first_sent) or added or removed:
+                            await post_table(keys_now, force=True)
+                            LAST_OPEN_KEYS = keys_now
+                            first_sent = True
+
+                finally:
+                    # stop heartbeat when leaving connection context
+                    stop_hb.set()
+                    try:
+                        hb_task.cancel()
+                    except Exception:
+                        pass
+
+        except (ConnectionClosedOK, ConnectionClosedError) as e:
+            # 1000 OK or other closure — reconnect quickly
+            print(f"WS closed: {e}. Reconnecting…")
+            await asyncio.sleep(2)
+            backoff = 1
+            continue
         except Exception as e:
             print(f"WS loop error: {e}")
             await asyncio.sleep(min(backoff, 30))
             backoff = min(backoff * 2, 60)
 
-    # close client (unreached in worker mode)
+    # (never reached in a worker)
     if notion_client is not None:
         await notion_client.aclose()
 
