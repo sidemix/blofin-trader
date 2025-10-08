@@ -1,9 +1,10 @@
 # main.py
-# BloFin → (Discord alerts) + Notion database
-# - Detect OPEN/CLOSE from BloFin WS 'positions'
-# - On OPEN: upsert a Notion page (Status=Open, fill entry fields)
-# - On CLOSE: update same page (Status=Closed, fill exit/PnL fields)
+# BloFin → Notion (plus optional Discord alerts)
+# - Detects OPEN/CLOSE from BloFin WS 'positions'
+# - On OPEN: upsert a Notion page (Status=<OPEN_LABEL>, fill entry fields)
+# - On CLOSE: update same page (Status=<CLOSED_LABEL>, fill exit/PnL fields)
 # - Discord alerts are optional (set DISCORD_WEBHOOK_URL to enable)
+# - Auto-detects Notion property types (Status: status vs select) to avoid 400 errors.
 
 import os
 import json
@@ -29,11 +30,7 @@ API_KEY = os.environ["BLOFIN_API_KEY"]
 API_SECRET = os.environ["BLOFIN_API_SECRET"]
 PASSPHRASE = os.environ["BLOFIN_PASSPHRASE"]
 IS_DEMO = os.getenv("BLOFIN_IS_DEMO", "false").lower() == "true"
-WS_URL = (
-    "wss://demo-trading-openapi.blofin.com/ws/private"
-    if IS_DEMO
-    else "wss://openapi.blofin.com/ws/private"
-)
+WS_URL = "wss://demo-trading-openapi.blofin.com/ws/private" if IS_DEMO else "wss://openapi.blofin.com/ws/private"
 
 # Discord (optional)
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -60,9 +57,12 @@ P_NET     = os.getenv("NOTION_PROP_NET", "Net Profit / Loss")
 P_ACCT    = os.getenv("NOTION_PROP_ACCOUNT", "Account")
 P_TRADEID = os.getenv("NOTION_PROP_TRADE_ID", "Trade ID")
 
+# Your label text in Notion for open/closed
+STATUS_OPEN_LABEL   = os.getenv("NOTION_STATUS_OPEN_LABEL", "Open")      # e.g., "1.Open"
+STATUS_CLOSED_LABEL = os.getenv("NOTION_STATUS_CLOSED_LABEL", "Closed")  # e.g., "3.Closed"
+
 # Behavior
 SIZE_EPS = float(os.getenv("SIZE_EPS", "1e-8"))
-SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5"))
 
 # ---------- Utils ----------
 def fnum(x, d=6):
@@ -72,7 +72,6 @@ def fnum(x, d=6):
         return str(x or "")
 
 def now_iso():
-    # ISO-like, fine for Notion date
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 def parse_size(row: dict) -> float:
@@ -102,7 +101,6 @@ OpenKey = Tuple[str, str]  # (instId, "Buy"/"Short")
 
 LATEST_ROW: Dict[OpenKey, dict] = {}
 LAST_OPEN_KEYS: Set[OpenKey] = set()
-LAST_POST_TIME: float = 0.0
 
 # mapping open position -> Notion page id
 OPEN_PAGE_IDS: Dict[OpenKey, str] = {}
@@ -137,30 +135,77 @@ async def send_discord(msg: str):
     if DISCORD_WEBHOOK:
         await SEND_Q.put(msg)
 
-# ---------- Notion client ----------
+# ---------- Notion client & schema detection ----------
+N_BASE = "https://api.notion.com/v1"
 N_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_TOKEN}",
     "Notion-Version": NOTION_VERSION,
     "Content-Type": "application/json",
 }
 
+# Will be set at runtime after we read DB schema
+_STATUS_FILTER_KIND = "status"  # or "select"
+
+async def notion_get_db_schema(client: httpx.AsyncClient) -> dict:
+    r = await client.get(f"{N_BASE}/databases/{NOTION_DATABASE_ID}", headers=N_HEADERS)
+    # Helpful error print if misconfigured
+    if r.status_code >= 400:
+        print("Notion DB schema error:", r.status_code, r.text)
+    r.raise_for_status()
+    return r.json()
+
+async def init_schema_and_labels(client: httpx.AsyncClient):
+    """Detect whether P_STATUS is 'status' or 'select' and configure filters accordingly."""
+    global _STATUS_FILTER_KIND
+    schema = await notion_get_db_schema(client)
+    props = schema.get("properties", {})
+
+    status_prop = props.get(P_STATUS)
+    if not status_prop:
+        raise RuntimeError(f"Notion DB missing property '{P_STATUS}'. Check NOTION_PROP_STATUS.")
+
+    ptype = status_prop.get("type")
+    if ptype == "status":
+        _STATUS_FILTER_KIND = "status"
+    elif ptype == "select":
+        _STATUS_FILTER_KIND = "select"
+    else:
+        # Fallback: treat like select
+        _STATUS_FILTER_KIND = "select"
+
+def status_filter_equals(label: str) -> dict:
+    # Returns the correct filter snippet depending on property type
+    if _STATUS_FILTER_KIND == "status":
+        return {"property": P_STATUS, "status": {"equals": label}}
+    else:
+        return {"property": P_STATUS, "select": {"equals": label}}
+
+def direction_filter_equals(label: str) -> dict:
+    # Direction is expected to be a select
+    return {"property": P_DIR, "select": {"equals": label}}
+
+def title_filter_equals(symbol: str) -> dict:
+    return {"property": P_TITLE, "title": {"equals": symbol}}
+
 async def notion_query_open_page(client: httpx.AsyncClient, symbol: str, direction: str) -> Optional[str]:
     """Return an existing OPEN page id for (symbol, direction), else None."""
     payload = {
         "filter": {
             "and": [
-                {"property": P_TITLE,  "title":  {"equals": symbol}},
-                {"property": P_DIR,    "select": {"equals": direction}},
-                {"property": P_STATUS, "status": {"equals": "Open"}}
+                title_filter_equals(symbol),
+                direction_filter_equals(direction),
+                status_filter_equals(STATUS_OPEN_LABEL),
             ]
         },
         "page_size": 1
     }
     r = await client.post(
-        f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+        f"{N_BASE}/databases/{NOTION_DATABASE_ID}/query",
         headers=N_HEADERS,
         json=payload,
     )
+    if r.status_code == 400:
+        print("Notion 400 in notion_query_open_page:", r.text)
     r.raise_for_status()
     res = r.json()
     results = res.get("results", [])
@@ -174,7 +219,6 @@ async def notion_create_open_page(client: httpx.AsyncClient, key: OpenKey, row: 
     upnl = row.get("unrealizedPnl")
     pct  = pct_signed(row.get("unrealizedPnlRatio"))
 
-    # Stable Trade ID (symbol|direction|first-seen-ts)
     open_ts = str(row.get("updateTime") or row.get("createTime") or int(time.time() * 1000))
     trade_id = f"{symbol}|{direction}|{open_ts}"
 
@@ -182,7 +226,8 @@ async def notion_create_open_page(client: httpx.AsyncClient, key: OpenKey, row: 
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": {
             P_TITLE:   {"title": [{"text": {"content": symbol}}]},
-            P_STATUS:  {"status": {"name": "Open"}},
+            P_STATUS:  ({_STATUS_FILTER_KIND: {"name": STATUS_OPEN_LABEL}} if _STATUS_FILTER_KIND == "status"
+                        else {"select": {"name": STATUS_OPEN_LABEL}}),
             P_DIR:     {"select": {"name": direction}},
             P_LEV:     {"number": float(lev) if lev not in (None, "") else None},
             P_QTY:     {"number": qty},
@@ -194,50 +239,51 @@ async def notion_create_open_page(client: httpx.AsyncClient, key: OpenKey, row: 
             P_TRADEID: {"rich_text": [{"text": {"content": trade_id}}]},
         }
     }
-    r = await client.post("https://api.notion.com/v1/pages", headers=N_HEADERS, json=data)
+    r = await client.post(f"{N_BASE}/pages", headers=N_HEADERS, json=data)
+    if r.status_code >= 400:
+        print("Notion create error:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()["id"]
 
 async def notion_update_close_page(client: httpx.AsyncClient, page_id: str, key: OpenKey, row: dict):
-    """Mark Closed and fill exit numbers."""
-    # Best-effort values from last snapshot we saw
     exit_px = row.get("markPrice") or row.get("lastPrice") or row.get("price")
-    cpnl    = row.get("unrealizedPnl")  # last seen before disappearance
+    cpnl    = row.get("unrealizedPnl")      # last seen before disappearance
     pct     = pct_signed(row.get("unrealizedPnlRatio"))
     net     = cpnl
 
     props = {
-        P_STATUS: {"status": {"name": "Closed"}},
-        P_EXIT:   {"number": float(exit_px) if exit_px not in (None, "") else None},
-        P_CLOSED: {"date": {"start": now_iso()}},
-        P_CPNL:   {"number": float(cpnl) if cpnl not in (None, "") else None},
-        P_PCT:    {"number": float(pct) if pct is not None else None},
-        P_NET:    {"number": float(net) if net not in (None, "") else None},
-        P_UPNL:   {"number": None},  # clear live uPnL
+        P_STATUS:  ({_STATUS_FILTER_KIND: {"name": STATUS_CLOSED_LABEL}} if _STATUS_FILTER_KIND == "status"
+                    else {"select": {"name": STATUS_CLOSED_LABEL}}),
+        P_EXIT:    {"number": float(exit_px) if exit_px not in (None, "") else None},
+        P_CLOSED:  {"date": {"start": now_iso()}},
+        P_CPNL:    {"number": float(cpnl) if cpnl not in (None, "") else None},
+        P_PCT:     {"number": float(pct) if pct is not None else None},
+        P_NET:     {"number": float(net) if net not in (None, "") else None},
+        P_UPNL:    {"number": None},
     }
-    r = await client.patch(
-        f"https://api.notion.com/v1/pages/{page_id}",
-        headers=N_HEADERS,
-        json={"properties": props},
-    )
+    r = await client.patch(f"{N_BASE}/pages/{page_id}", headers=N_HEADERS, json={"properties": props})
+    if r.status_code >= 400:
+        print("Notion update(close) error:", r.status_code, r.text)
     r.raise_for_status()
 
 async def notion_load_existing_opens(client: httpx.AsyncClient):
-    """On startup: prefill OPEN_PAGE_IDS from Notion (so restarts don't duplicate)."""
+    """Prefill OPEN_PAGE_IDS from Notion (handles restarts)."""
     start_cursor = None
     while True:
         payload = {
-            "filter": {"property": P_STATUS, "status": {"equals": "Open"}},
+            "filter": status_filter_equals(STATUS_OPEN_LABEL),
             "page_size": 100
         }
         if start_cursor:
             payload["start_cursor"] = start_cursor
 
         r = await client.post(
-            f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+            f"{N_BASE}/databases/{NOTION_DATABASE_ID}/query",
             headers=N_HEADERS,
             json=payload,
         )
+        if r.status_code == 400:
+            print("Notion 400 in notion_load_existing_opens:", r.text)
         r.raise_for_status()
         res = r.json()
 
@@ -287,7 +333,7 @@ def keys_from_rows(rows: List[dict]) -> Set[OpenKey]:
             continue
         key = (str(r.get("instId")), side_of(r))
         keys.add(key)
-        LATEST_ROW[key] = r  # keep the freshest row for display on alerts/updates
+        LATEST_ROW[key] = r  # keep freshest row
     return keys
 
 # ---------- Main loop ----------
@@ -296,11 +342,14 @@ async def run():
     asyncio.create_task(discord_sender())
 
     async with httpx.AsyncClient(timeout=15) as notion_client:
-        # Prefill open pages mapping from Notion (handles restarts)
+        # 1) Detect schema (sets _STATUS_FILTER_KIND)
+        await init_schema_and_labels(notion_client)
+        # 2) Prefill any open pages (so restarts don't duplicate)
         await notion_load_existing_opens(notion_client)
 
         backoff = 1
         first_snapshot = True
+        global LAST_OPEN_KEYS
 
         while True:
             try:
@@ -332,7 +381,7 @@ async def run():
                         added = sorted(list(keys_now - LAST_OPEN_KEYS))
                         removed = sorted(list(LAST_OPEN_KEYS - keys_now))
 
-                        # Skip alerts on the very first snapshot (they would be historical)
+                        # Skip alerts on first snapshot (they'd be historical)
                         if not first_snapshot:
                             # --- NEW TRADES ---
                             for key in added:
@@ -353,7 +402,6 @@ async def run():
                                 last_row = LATEST_ROW.get(key, {})
                                 page_id = OPEN_PAGE_IDS.get(key)
                                 if not page_id:
-                                    # fallback query if mapping missing
                                     page_id = await notion_query_open_page(notion_client, key[0], key[1])
                                 if page_id:
                                     await notion_update_close_page(notion_client, page_id, key, last_row)
@@ -363,7 +411,9 @@ async def run():
                         LAST_OPEN_KEYS = keys_now
                         first_snapshot = False
 
-            except Exception:
+            except Exception as e:
+                # helpful log for debugging Notion/BloFin issues
+                print("Loop error:", repr(e))
                 await asyncio.sleep(min(backoff, 30))
                 backoff = min(backoff * 2, 60)
 
