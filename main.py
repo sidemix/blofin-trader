@@ -1,9 +1,11 @@
 # main.py
 # BloFin → Notion (plus optional Discord alerts)
 # - Detect OPEN/CLOSE from BloFin WS 'positions'
-# - On OPEN: upsert a Notion page (fills only properties that exist & match type)
-# - On CLOSE: update the same page
-# - Handles Notion Status as status or select; Account as relation or select
+# - On OPEN: create a Notion row (only props that exist & match type)
+# - On CLOSE: update that row (Status Closed, fill exit/pnl if present)
+# - Status may be 'status' or 'select' (auto-detected)
+# - Account is a relation (set only if NOTION_ACCOUNT_PAGE_ID is given)
+# - Direction posted as 'Long' or 'Short' (matches your DB)
 
 import os, json, time, hmac, base64, hashlib, asyncio
 from typing import Dict, Tuple, List, Optional, Set
@@ -30,7 +32,7 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Notion
 NOTION_API_TOKEN = os.environ["NOTION_API_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]  # real DB id
+NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]  # *** this must be the real DB id ***
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
 
 # Notion property names (override to match your DB)
@@ -43,12 +45,12 @@ P_ENTRY   = os.getenv("NOTION_PROP_ENTRY", "Entry Price")
 P_OPENED  = os.getenv("NOTION_PROP_DATE_OPEN", "Date Opened")
 P_EXIT    = os.getenv("NOTION_PROP_EXIT", "Exit Price")
 P_CLOSED  = os.getenv("NOTION_PROP_DATE_CLOSE", "Date Closed")
-P_UPNL    = os.getenv("NOTION_PROP_UPNL", "Unrealized P&L")   # optional; skip if missing
-P_CPNL    = os.getenv("NOTION_PROP_CPNL", "Closed P&L")       # optional
-P_PCT     = os.getenv("NOTION_PROP_PCT", "P&L %")             # optional
-P_NET     = os.getenv("NOTION_PROP_NET", "Net Profit / Loss") # optional
-P_ACCT    = os.getenv("NOTION_PROP_ACCOUNT", "Account")       # relation or select
-P_TRADEID = os.getenv("NOTION_PROP_TRADE_ID", "Trade ID")     # optional rich_text
+P_UPNL    = os.getenv("NOTION_PROP_UPNL", "")             # optional
+P_CPNL    = os.getenv("NOTION_PROP_CPNL", "Closed P&L")   # optional
+P_PCT     = os.getenv("NOTION_PROP_PCT", "P&L %")         # optional
+P_NET     = os.getenv("NOTION_PROP_NET", "")              # optional
+P_ACCT    = os.getenv("NOTION_PROP_ACCOUNT", "Account")   # relation or skip
+P_TRADEID = os.getenv("NOTION_PROP_TRADE_ID", "")         # optional rich_text
 
 # Status labels
 STATUS_OPEN_LABEL   = os.getenv("NOTION_STATUS_OPEN_LABEL", "Open")      # e.g. "1.Open"
@@ -74,7 +76,7 @@ def parse_size(row: dict) -> float:
     except Exception: return 0.0
 
 def dir_long_short(row: dict) -> str:
-    # Notion column uses "Long"/"Short" in your DB
+    # Your Notion 'Direction' shows Long/Short
     s = str(row.get("positionSide") or "").lower()
     if s in ("long", "buy"):  return "Long"
     if s in ("short", "sell"): return "Short"
@@ -132,14 +134,16 @@ DB_PROPS: Dict[str, dict] = {}     # property schema
 STATUS_KIND = "status"             # "status" or "select" (detected)
 
 def prop_exists(name: str) -> bool:
-    return name in DB_PROPS
+    return bool(name) and name in DB_PROPS
 
 def prop_type(name: str) -> Optional[str]:
+    if not name: return None
     return DB_PROPS.get(name, {}).get("type")
 
 async def load_db_schema(client: httpx.AsyncClient):
     r = await client.get(f"{N_BASE}/databases/{NOTION_DATABASE_ID}", headers=N_HEADERS)
     if r.status_code >= 400:
+        # This is where Notion will complain if you pass a PAGE id instead of a DATABASE id
         print("Notion DB schema error:", r.status_code, r.text)
     r.raise_for_status()
     schema = r.json()
@@ -149,6 +153,8 @@ async def load_db_schema(client: httpx.AsyncClient):
     global STATUS_KIND
     pt = prop_type(P_STATUS)
     STATUS_KIND = "status" if pt == "status" else "select"
+    # Helpful one-time print so you can see exactly what Notion exposes:
+    print("Notion properties detected:", {k: v.get("type") for k, v in DB_PROPS.items()})
 
 def status_set(label: str) -> dict:
     return {"status": {"name": label}} if STATUS_KIND == "status" else {"select": {"name": label}}
@@ -160,9 +166,9 @@ def status_filter_equals(label: str) -> dict:
 def direction_select(label: str) -> Optional[dict]:
     if prop_type(P_DIR) == "select":
         return {"select": {"name": label}}
-    return None
+    return None  # skip if Direction isn't a select in your DB
 
-# Build properties dicts safely (only include what exists and matches expected type)
+# Build properties safely (only include what exists & matches expected type)
 def build_open_properties(symbol: str, direction: str, row: dict) -> dict:
     props = {}
 
@@ -176,12 +182,13 @@ def build_open_properties(symbol: str, direction: str, row: dict) -> dict:
 
     # Direction
     ds = direction_select(direction)
-    if ds: props[P_DIR] = ds
+    if ds:
+        props[P_DIR] = ds
 
-    # Numbers
+    # Numbers (if present in DB)
     mapping_num = [
-        (P_LEV, row.get("leverage")),
-        (P_QTY, parse_size(row)),
+        (P_LEV,   row.get("leverage")),
+        (P_QTY,   parse_size(row)),
         (P_ENTRY, row.get("entryPrice") or row.get("avgPrice") or row.get("averagePrice")),
     ]
     for name, val in mapping_num:
@@ -189,32 +196,28 @@ def build_open_properties(symbol: str, direction: str, row: dict) -> dict:
             try: props[name] = {"number": float(val)}
             except Exception: pass
 
-    # Optional: Date Opened
+    # Optional dates
     if prop_type(P_OPENED) == "date":
         props[P_OPENED] = {"date": {"start": now_iso()}}
 
-    # Optional: Unrealized P&L (number)
+    # Optional: Unrealized P&L
     if prop_type(P_UPNL) == "number":
         upnl = row.get("unrealizedPnl")
         if upnl not in (None, ""):
             try: props[P_UPNL] = {"number": float(upnl)}
             except Exception: pass
 
-    # Optional: P&L % (number)
+    # Optional: P&L %
     if prop_type(P_PCT) == "number":
         pct = pct_signed(row.get("unrealizedPnlRatio"))
         if pct is not None:
             props[P_PCT] = {"number": pct}
 
-    # Account: select or relation
-    pt = prop_type(P_ACCT)
-    if pt == "select":
-        props[P_ACCT] = {"select": {"name": "Blofin"}}
-    elif pt == "relation" and NOTION_ACCOUNT_PAGE_ID:
+    # Account: only if it's a relation AND you provided a target page id
+    if prop_type(P_ACCT) == "relation" and NOTION_ACCOUNT_PAGE_ID:
         props[P_ACCT] = {"relation": [{"id": NOTION_ACCOUNT_PAGE_ID}]}
-    # else: skip to avoid type errors
 
-    # Optional: Trade ID (rich_text)
+    # Optional Trade ID (rich_text)
     if prop_type(P_TRADEID) == "rich_text":
         open_ts = str(row.get("updateTime") or row.get("createTime") or int(time.time() * 1000))
         trade_id = f"{symbol}|{direction}|{open_ts}"
@@ -224,51 +227,48 @@ def build_open_properties(symbol: str, direction: str, row: dict) -> dict:
 
 def build_close_properties(row: dict) -> dict:
     props = {}
-    # Status
+
     if prop_exists(P_STATUS) and prop_type(P_STATUS) in ("status", "select"):
         props[P_STATUS] = status_set(STATUS_CLOSED_LABEL)
-    # Exit price
+
     if prop_type(P_EXIT) == "number":
         exit_px = row.get("markPrice") or row.get("lastPrice") or row.get("price")
         if exit_px not in (None, ""):
             try: props[P_EXIT] = {"number": float(exit_px)}
             except Exception: pass
-    # Date Closed
+
     if prop_type(P_CLOSED) == "date":
         props[P_CLOSED] = {"date": {"start": now_iso()}}
-    # Closed P&L
+
     if prop_type(P_CPNL) == "number":
         cpnl = row.get("unrealizedPnl")
         if cpnl not in (None, ""):
             try: props[P_CPNL] = {"number": float(cpnl)}
             except Exception: pass
-    # P&L %
+
     if prop_type(P_PCT) == "number":
         pct = pct_signed(row.get("unrealizedPnlRatio"))
         if pct is not None:
             props[P_PCT] = {"number": pct}
-    # Net Profit/Loss
+
     if prop_type(P_NET) == "number":
         net = row.get("unrealizedPnl")
         if net not in (None, ""):
             try: props[P_NET] = {"number": float(net)}
             except Exception: pass
-    # Clear Unrealized P&L if present
+
     if prop_type(P_UPNL) == "number":
-        props[P_UPNL] = {"number": None}
+        props[P_UPNL] = {"number": None}  # clear live uPnL
+
     return props
 
 async def notion_query_open_page(client: httpx.AsyncClient, symbol: str, direction: str) -> Optional[str]:
-    payload = {
-        "filter": {
-            "and": [
-                {"property": P_TITLE, "title": {"equals": symbol}},
-                {"property": P_DIR, "select": {"equals": direction}} if prop_type(P_DIR)=="select" else {"property": P_DIR, "rich_text": {"equals": direction}},
-                status_filter_equals(STATUS_OPEN_LABEL)
-            ]
-        },
-        "page_size": 1
-    }
+    # Build a flexible filter: if Direction isn't a select, omit it from the filter
+    filter_and = [ {"property": P_TITLE, "title": {"equals": symbol}}, status_filter_equals(STATUS_OPEN_LABEL) ]
+    if prop_type(P_DIR) == "select":
+        filter_and.insert(1, {"property": P_DIR, "select": {"equals": direction}})
+
+    payload = {"filter": {"and": filter_and}, "page_size": 1}
     r = await client.post(f"{N_BASE}/databases/{NOTION_DATABASE_ID}/query", headers=N_HEADERS, json=payload)
     if r.status_code == 400:
         print("Notion 400 in query:", r.text)
@@ -277,10 +277,7 @@ async def notion_query_open_page(client: httpx.AsyncClient, symbol: str, directi
     return res.get("results", [{}])[0].get("id") if res.get("results") else None
 
 async def notion_create_open_page(client: httpx.AsyncClient, symbol: str, direction: str, row: dict) -> str:
-    data = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
-        "properties": build_open_properties(symbol, direction, row)
-    }
+    data = { "parent": {"database_id": NOTION_DATABASE_ID}, "properties": build_open_properties(symbol, direction, row) }
     r = await client.post(f"{N_BASE}/pages", headers=N_HEADERS, json=data)
     if r.status_code >= 400:
         print("Notion create error:", r.status_code, r.text)
@@ -330,7 +327,7 @@ async def run():
     asyncio.create_task(discord_sender())
 
     async with httpx.AsyncClient(timeout=20) as notion_client:
-        # Read schema so we know what exists/types
+        # Load schema so we only write valid properties/types
         await load_db_schema(notion_client)
 
         backoff = 1
@@ -369,9 +366,13 @@ async def run():
                             for (symbol, direction) in added:
                                 page_id = await notion_query_open_page(notion_client, symbol, direction)
                                 if not page_id:
-                                    page_id = await notion_create_open_page(notion_client, symbol, direction, LATEST_ROW[(symbol, direction)])
+                                    page_id = await notion_create_open_page(
+                                        notion_client, symbol, direction, LATEST_ROW[(symbol, direction)]
+                                    )
                                 OPEN_PAGE_IDS[(symbol, direction)] = page_id
-                                avg = LATEST_ROW[(symbol, direction)].get("entryPrice") or LATEST_ROW[(symbol, direction)].get("avgPrice") or LATEST_ROW[(symbol, direction)].get("averagePrice")
+                                avg = (LATEST_ROW[(symbol, direction)].get("entryPrice")
+                                       or LATEST_ROW[(symbol, direction)].get("avgPrice")
+                                       or LATEST_ROW[(symbol, direction)].get("averagePrice"))
                                 await send_discord(f"🟢 New trade: **{symbol}** {direction} @ avg {fnum(avg,6)}")
 
                             # Closed
