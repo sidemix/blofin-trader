@@ -1,14 +1,13 @@
 # main.py
-# BloFin → Discord (+ Notion)
-# - Discord: table + 🟢 New / 🔴 Closed alerts (same format you liked)
-# - Notion: upsert on open, close on closed, periodic mark updates
-# - NEW: BloFin app-level heartbeat {"op":"ping"} to prevent 1000 closes
+# BloFin → Discord + Notion
+# - Discord: compact positions table, plus New/Closed alert blocks
+# - Notion: upsert "Open" trades and update the same page to "Closed" using Trade Key
+# - Periodic table refresh every PERIOD_HOURS (default 6h)
 
 import os, json, time, hmac, base64, hashlib, asyncio
 from typing import Dict, Tuple, List, Optional
 
 import websockets
-from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 import httpx
 
 # ========== ENV ==========
@@ -18,48 +17,44 @@ try:
 except Exception:
     pass
 
-API_KEY = os.environ["BLOFIN_API_KEY"]
+# ---- BloFin
+API_KEY    = os.environ["BLOFIN_API_KEY"]
 API_SECRET = os.environ["BLOFIN_API_SECRET"]
 PASSPHRASE = os.environ["BLOFIN_PASSPHRASE"]
+IS_DEMO    = os.getenv("BLOFIN_IS_DEMO", "false").lower() == "true"
+WS_URL     = "wss://demo-trading-openapi.blofin.com/ws/private" if IS_DEMO else "wss://openapi.blofin.com/ws/private"
 
-# Discord webhooks
+# ---- Discord
 WEBHOOK_TABLE  = os.getenv("DISCORD_WEBHOOK_TABLE")  or os.environ["DISCORD_WEBHOOK_URL"]
 WEBHOOK_ALERTS = os.getenv("DISCORD_WEBHOOK_ALERTS") or os.environ["DISCORD_WEBHOOK_URL"]
+TABLE_TITLE    = os.getenv("TABLE_TITLE", "Active BloFin Positions")
+SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5"))  # seconds min between tables
+PERIOD_HOURS   = float(os.getenv("PERIOD_HOURS", "6"))          # 0 disables
 
-IS_DEMO      = os.getenv("BLOFIN_IS_DEMO", "false").lower() == "true"
-TABLE_TITLE  = os.getenv("TABLE_TITLE", "Active BloFin Positions")
-SIZE_EPS     = float(os.getenv("SIZE_EPS", "0.00000001"))
-SEND_MIN_INTERVAL = float(os.getenv("SEND_MIN_INTERVAL", "5"))
-PERIOD_HOURS = float(os.getenv("PERIOD_HOURS", "6"))  # 0 = disable periodic
+# ---- Notion
+NOTION_TOKEN   = os.getenv("NOTION_API_TOKEN", "")
+NOTION_DB_ID   = os.getenv("NOTION_DATABASE_ID", "")
+N_VER          = os.getenv("NOTION_VERSION", "2022-06-28")
 
-# NEW: app-level WS heartbeat (seconds)
-HEARTBEAT_SEC = float(os.getenv("HEARTBEAT_SEC", "15"))
+# Property names (defaults match your DB)
+N_TITLE        = os.getenv("NOTION_PROP_TITLE", "Trade Name")
+N_STATUS       = os.getenv("NOTION_PROP_STATUS", "Status")
+N_STATUS_OPEN  = os.getenv("NOTION_STATUS_OPEN_LABEL", "1.Open")
+N_STATUS_CLOSED= os.getenv("NOTION_STATUS_CLOSED_LABEL", "3.Closed")
+N_DIR          = os.getenv("NOTION_PROP_DIRECTION", "Direction")
+N_LEV          = os.getenv("NOTION_PROP_LEVERAGE", "Leverage")
+N_QTY          = os.getenv("NOTION_PROP_QTY", "Qty")
+N_ENTRY        = os.getenv("NOTION_PROP_ENTRY", "Entry Price")
+N_EXIT         = os.getenv("NOTION_PROP_EXIT", "Exit Price")
+N_MARK         = os.getenv("NOTION_PROP_MARK", "Market Price")
+N_CPNL         = os.getenv("NOTION_PROP_CPNL", "Closed P&L")
+N_PCT          = os.getenv("NOTION_PROP_PCT", "P&L %")
+N_DATE_OPENED  = os.getenv("NOTION_PROP_DATE_OPENED", "Date Opened")
+N_DATE_CLOSED  = os.getenv("NOTION_PROP_DATE_CLOSED", "Date Closed")
+N_TRADE_KEY    = os.getenv("NOTION_PROP_TRADE_KEY", "Trade Key")     # NEW (Text)
 
-WS_URL = (
-    "wss://demo-trading-openapi.blofin.com/ws/private"
-    if IS_DEMO else
-    "wss://openapi.blofin.com/ws/private"
-)
-
-# ---------- Notion ENV ----------
-NOTION_TOKEN = os.getenv("NOTION_API_TOKEN")
-NOTION_DB_ID = os.getenv("NOTION_DATABASE_ID")
-N_VER = os.getenv("NOTION_VERSION", "2022-06-28")
-
-# property names (map to your DB)
-N_TITLE       = os.getenv("NOTION_PROP_TITLE", "Trade Name")
-N_STATUS      = os.getenv("NOTION_PROP_STATUS", "Status")
-N_DIR         = os.getenv("NOTION_PROP_DIRECTION", "Direction")
-N_LEV         = os.getenv("NOTION_PROP_LEVERAGE", "Leverage")
-N_QTY         = os.getenv("NOTION_PROP_QTY", "Qty")
-N_ENTRY       = os.getenv("NOTION_PROP_ENTRY", "Entry Price")
-N_EXIT        = os.getenv("NOTION_PROP_EXIT", "Exit Price")
-N_MARK        = os.getenv("NOTION_PROP_MARK", "Market Price")
-N_DATE_OPEN   = os.getenv("NOTION_PROP_DATE_OPEN", "Date Opened")
-N_DATE_CLOSE  = os.getenv("NOTION_PROP_DATE_CLOSE", "Date Closed")
-
-N_STATUS_OPEN   = os.getenv("NOTION_STATUS_OPEN_LABEL", "1.Open")
-N_STATUS_CLOSED = os.getenv("NOTION_STATUS_CLOSED_LABEL", "3.Closed")
+# ---- Parsing / sizing
+SIZE_EPS       = float(os.getenv("SIZE_EPS", "0.00000001"))  # size <= EPS == closed
 
 # ========== Discord sender (queue + 429) ==========
 SEND_Q: asyncio.Queue = asyncio.Queue()
@@ -81,6 +76,7 @@ async def discord_sender():
                     r.raise_for_status()
                     await asyncio.sleep(1.1)
             except Exception:
+                # swallow & keep going
                 await asyncio.sleep(2.0)
             finally:
                 SEND_Q.task_done()
@@ -91,8 +87,9 @@ async def send_to(url: str, text: str):
 async def send_table(text: str):   return await send_to(WEBHOOK_TABLE, text)
 async def send_alert(text: str):   return await send_to(WEBHOOK_ALERTS, text)
 
-# ========== WS auth/sub ==========
+# ========== BloFin WS auth/sub ==========
 def ws_login_payload() -> dict:
+    # Works with current BloFin gateway
     ts = str(int(time.time() * 1000))
     nonce = ts
     msg = "/users/self/verify" + "GET" + ts + nonce
@@ -112,30 +109,71 @@ def sub_payloads() -> List[dict]:
 def is_push(msg: dict) -> bool:
     return "data" in msg and ("arg" in msg or "action" in msg)
 
-# ========== Helpers ==========
+# ========== Parsing helpers ==========
 def fnum(x, d=6):
-    try:
-        return f"{float(x):.{d}f}"
-    except:
-        return str(x or "")
+    try: return f"{float(x):.{d}f}"
+    except: return str(x or "")
 
 def parse_size(row: dict) -> float:
-    s = row.get("positions") or row.get("pos") or row.get("size") or 0
-    try:
-        return float(s)
-    except:
-        return 0.0
+    for k in ("positions","pos","size"):
+        if k in row:
+            try: return float(row[k])
+            except: pass
+    return 0.0
+
+def row_inst(row: dict) -> str:
+    return str(row.get("instId") or row.get("symbol") or "")
+
+def row_leverage(row: dict) -> Optional[float]:
+    v = row.get("leverage")
+    try: return float(v) if v is not None else None
+    except: return None
+
+def row_entry_price(row: dict) -> Optional[float]:
+    for k in ("avgPx","avgPrice","averagePrice","entryPrice","avgEntryPx"):
+        if k in row:
+            try: return float(row[k])
+            except: pass
+    return None
+
+def row_mark(row: dict) -> Optional[float]:
+    for k in ("markPx","mark","markPrice"):
+        if k in row:
+            try: return float(row[k])
+            except: pass
+    return None
+
+def row_qty(row: dict) -> Optional[float]:
+    for k in ("qty","quantity","pos","positions","size"):
+        if k in row:
+            try: return float(row[k])
+            except: pass
+    return None
+
+def row_unreal_pnl(row: dict) -> Optional[float]:
+    for k in ("uPnl","unrealizedPnl"):
+        if k in row:
+            try: return float(row[k])
+            except: pass
+    return None
+
+def row_unreal_ratio(row: dict) -> Optional[float]:
+    for k in ("uPnlRatio","unrealizedPnlRatio"):
+        if k in row:
+            try: return float(row[k])
+            except: pass
+    return None
 
 def infer_side(row: dict) -> str:
-    s = str(row.get("positionSide") or row.get("posSide") or "").lower()
-    if s in ("long", "buy"):  return "Buy"
-    if s in ("short", "sell"): return "Short"
+    s = str(row.get("positionSide") or "").lower()
+    if s in ("long","buy"):  return "Buy"
+    if s in ("short","sell"): return "Short"
     sz = parse_size(row)
     if sz > 0: return "Buy"
     if sz < 0: return "Short"
     return "Buy"
 
-def fmt_signed_pct(ratio) -> str:
+def fmt_signed_pct(ratio: Optional[float]) -> str:
     try:
         v = float(ratio) * 100.0
         sign = "+" if v >= 0 else ""
@@ -143,67 +181,38 @@ def fmt_signed_pct(ratio) -> str:
     except:
         return ""
 
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
-
 # ========== State ==========
 OpenKey = Tuple[str, str]  # (instId, "Buy"/"Short")
-LATEST_ROW: Dict[OpenKey, dict] = {}    # freshest row for each open key
-LAST_OPEN_KEYS: set[OpenKey] = set()    # for open/close detection
+LATEST_ROW: Dict[OpenKey, dict] = {}     # cache latest row for display
+LAST_OPEN_KEYS: set[OpenKey] = set()     # set of open pos keys
 LAST_POST_TIME: float = 0.0
 
-# cache: Notion page id per open position
-OPEN_PAGE_IDS: Dict[OpenKey, str] = {}
+# Notion schema + open-page cache
+N_SCHEMA_PROPS: set[str] = set()
+OPEN_PAGE_IDS: Dict[OpenKey, str] = {}   # { (inst, side) : page_id }
 
 def keys_from_rows(rows: List[dict]) -> set[OpenKey]:
     keys: set[OpenKey] = set()
     for r in rows:
         if abs(parse_size(r)) <= SIZE_EPS:
             continue
-        k = (str(r.get("instId")), infer_side(r))
+        k = (row_inst(r), infer_side(r))
         keys.add(k)
         LATEST_ROW[k] = r
     return keys
 
-def row_entry_price(r: dict) -> Optional[float]:
-    for k in ("entryPrice", "avgPrice", "averagePrice", "avgEntryPrice"):
-        v = r.get(k)
-        if v is not None:
-            try: return float(v)
-            except: pass
-    return None
-
-def row_mark(r: dict) -> Optional[float]:
-    for k in ("markPrice", "markPx", "mark", "last"):
-        v = r.get(k)
-        if v is not None:
-            try: return float(v)
-            except: pass
-    return None
-
-def row_leverage(r: dict) -> Optional[float]:
-    v = r.get("leverage") or r.get("lev")
-    try: return float(v) if v is not None else None
-    except: return None
-
-def row_qty(r: dict) -> Optional[float]:
-    try:
-        return float(r.get("positions") or r.get("pos") or r.get("size") or 0.0)
-    except:
-        return None
-
-# ========== Formatting (Discord) ==========
+# ========== Discord formatting ==========
 def table_for_keys(keys: set[OpenKey]) -> str:
     headers = ["SYMBOL", "SIDE xLEV", "AVG Entry Price", "PNL", "PNL%"]
     rows: List[List[str]] = []
     for k in sorted(keys):
         r = LATEST_ROW.get(k, {})
         inst, side = k
-        lev  = row_leverage(r) or ""
-        avg  = row_entry_price(r) or ""
-        pnl  = r.get("unrealizedPnl")
-        pnlr = r.get("unrealizedPnlRatio")
-        sidelev = f"{side} {fnum(lev,0)}x" if str(lev) not in ("", "0") else side
+        lev  = row_leverage(r) or 0
+        avg  = row_entry_price(r)
+        pnl  = row_unreal_pnl(r)
+        pnlr = row_unreal_ratio(r)
+        sidelev = f"{side} {int(lev)}x" if lev else side
         rows.append([inst, sidelev, fnum(avg,6), fnum(pnl,6), fmt_signed_pct(pnlr)])
 
     cols = list(zip(*([headers] + rows))) if rows else [headers]
@@ -212,8 +221,7 @@ def table_for_keys(keys: set[OpenKey]) -> str:
 
     lines = [f"**{TABLE_TITLE}**", "```", fmt_row(headers), fmt_row(["-"*w for w in widths])]
     if rows:
-        for r in rows:
-            lines.append(fmt_row(r))
+        for r in rows: lines.append(fmt_row(r))
     else:
         lines.append("(no open positions)")
     lines.append("```")
@@ -225,11 +233,11 @@ def alert_block(title: str, keys: List[OpenKey]) -> str:
     for k in keys:
         r = LATEST_ROW.get(k, {})
         inst, side = k
-        lev  = row_leverage(r) or ""
-        avg  = row_entry_price(r) or ""
-        pnl  = r.get("unrealizedPnl")
-        pnlr = r.get("unrealizedPnlRatio")
-        sidelev = f"{side} {fnum(lev,0)}x" if str(lev) not in ("", "0") else side
+        lev  = row_leverage(r) or 0
+        avg  = row_entry_price(r)
+        pnl  = row_unreal_pnl(r)
+        pnlr = row_unreal_ratio(r)
+        sidelev = f"{side} {int(lev)}x" if lev else side
         rows.append([inst, sidelev, fnum(avg,6), fnum(pnl,6), fmt_signed_pct(pnlr)])
 
     cols = list(zip(*([headers] + rows))) if rows else [headers]
@@ -238,8 +246,7 @@ def alert_block(title: str, keys: List[OpenKey]) -> str:
 
     lines = [f"**{title}**", "```", fmt_row(headers), fmt_row(["-"*w for w in widths])]
     if rows:
-        for r in rows:
-            lines.append(fmt_row(r))
+        for r in rows: lines.append(fmt_row(r))
     else:
         lines.append("(none)")
     lines.append("```")
@@ -254,72 +261,116 @@ async def post_table(keys: set[OpenKey], force: bool = False):
     LAST_POST_TIME = now
 
 # ========== Notion helpers ==========
-def have_notion() -> bool:
-    return bool(NOTION_TOKEN and NOTION_DB_ID)
+def n_title(v: str): return {"title": [{"type": "text","text": {"content": v}}]}
+def n_select(name: str): return {"select": {"name": name}} if name else None
+def n_num(v: Optional[float]): return {"number": float(v)} if v is not None else {"number": None}
+def n_date_ts(ts: Optional[float]):
+    if ts is None: return {"date": None}
+    iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    return {"date": {"start": iso}}
+def n_rich(v: str): return {"rich_text": [{"type":"text","text":{"content": v}}]}
 
-N_SCHEMA_PROPS: set[str] = set()
+def pick(props: dict, name: str, value: Optional[dict]):
+    if name in N_SCHEMA_PROPS and value is not None:
+        props[name] = value
 
-def n_title(v: str): return {"title": [{"text": {"content": v}}]}
-def n_num(v: Optional[float]): return {"number": (float(v) if v is not None else None)}
-def n_select(name: Optional[str]): return {"select": ({"name": name} if name else None)}
-def n_date_iso(iso: Optional[str]): return {"date": ({"start": iso} if iso else None)}
-
-def pick(props: dict, name: str, val: dict):
-    if name in N_SCHEMA_PROPS:
-        props[name] = val
+def position_key(k: OpenKey) -> str:
+    inst, side = k
+    return f"{inst}|{side}"
 
 async def load_db_schema(client: httpx.AsyncClient):
-    if not have_notion(): return
+    """Load Notion DB schema and cache property names."""
+    global N_SCHEMA_PROPS
+    if not (NOTION_TOKEN and NOTION_DB_ID):
+        return
     r = await client.get(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}",
-        headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": N_VER}
+        headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": N_VER},
     )
     r.raise_for_status()
-    data = r.json()
-    N_SCHEMA_PROPS.clear()
-    N_SCHEMA_PROPS.update(list(data.get("properties", {}).keys()))
+    props = r.json().get("properties", {})
+    N_SCHEMA_PROPS = set(props.keys())
+
+async def notion_find_by_key(client: httpx.AsyncClient, key: str):
+    """Return (page_id, status_name or None) for the first page with Trade Key == key."""
+    if N_TRADE_KEY not in N_SCHEMA_PROPS:
+        return None, None
+    r = await client.post(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": N_VER},
+        json={"filter": {"property": N_TRADE_KEY, "rich_text": {"equals": key}}, "page_size": 1}
+    )
+    r.raise_for_status()
+    results = r.json().get("results", [])
+    if not results:
+        return None, None
+    page = results[0]
+    status_name = None
+    try:
+        status_name = page["properties"][N_STATUS]["select"]["name"]
+    except Exception:
+        pass
+    return page["id"], status_name
 
 async def notion_query_open_page(client: httpx.AsyncClient, inst: str, side: str) -> Optional[str]:
-    url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
-    filt = {
-        "and": [
-            {"property": N_TITLE,  "title": {"equals": inst}},
-            {"property": N_STATUS, "select": {"equals": N_STATUS_OPEN}},
-            {"property": N_DIR,    "select": {"equals": side}},
-        ]
+    """Legacy fallback lookup: Title + Status(Open) + Direction."""
+    if not all(x in N_SCHEMA_PROPS for x in (N_TITLE, N_STATUS, N_DIR)):
+        return None
+    payload = {
+        "filter": {
+            "and": [
+                {"property": N_TITLE,  "title":    {"equals": inst}},
+                {"property": N_STATUS, "select":   {"equals": N_STATUS_OPEN}},
+                {"property": N_DIR,    "select":   {"equals": "Long" if side == "Buy" else "Short"}},
+            ]
+        },
+        "page_size": 1
     }
     r = await client.post(
-        url,
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": N_VER},
-        json={"filter": filt, "page_size": 1},
+        json=payload
     )
     r.raise_for_status()
-    res = r.json()
-    results = res.get("results", [])
-    if results:
-        return results[0]["id"]
-    return None
+    results = r.json().get("results", [])
+    return results[0]["id"] if results else None
 
-async def notion_upsert_open(client: httpx.AsyncClient, k: OpenKey, r: dict) -> str:
+async def notion_upsert_open(client: httpx.AsyncClient, k: OpenKey, rrow: dict) -> Optional[str]:
+    """Create or update OPEN trade row in Notion; store Trade Key to link the future close."""
     inst, side = k
-    entry = row_entry_price(r)
-    qty   = row_qty(r)
-    lev   = row_leverage(r)
-    mark  = row_mark(r)
+    key  = position_key(k)
+    entry = row_entry_price(rrow)
+    qty   = row_qty(rrow)
+    lev   = row_leverage(rrow)
+    mark  = row_mark(rrow)
 
     page_id = OPEN_PAGE_IDS.get(k)
-    if not page_id:
-        page_id = await notion_query_open_page(client, inst, side)
 
+    if not page_id:
+        # Prefer Trade Key
+        pid, status_name = await notion_find_by_key(client, key)
+        if pid and status_name != N_STATUS_OPEN:
+            # same key but already closed => treat as a new cycle, create fresh page
+            page_id = None
+        else:
+            page_id = pid
+
+        # Fallback
+        if not page_id:
+            page_id = await notion_query_open_page(client, inst, side)
+
+    # Build properties
     props = {}
-    pick(props, N_TITLE, n_title(inst))
-    pick(props, N_STATUS, n_select(N_STATUS_OPEN))
-    pick(props, N_DIR, n_select("Long" if side == "Buy" else "Short"))
-    pick(props, N_LEV, n_num(lev))
-    pick(props, N_QTY, n_num(abs(qty) if qty is not None else None))
-    pick(props, N_ENTRY, n_num(entry))
-    pick(props, N_MARK, n_num(mark))
-    pick(props, N_DATE_OPEN, n_date_iso(now_iso()))
+    pick(props, N_TITLE,   n_title(inst))
+    pick(props, N_STATUS,  n_select(N_STATUS_OPEN))
+    pick(props, N_DIR,     n_select("Long" if side == "Buy" else "Short"))
+    pick(props, N_LEV,     n_num(lev))
+    pick(props, N_QTY,     n_num(abs(qty) if qty is not None else None))
+    pick(props, N_ENTRY,   n_num(entry))
+    pick(props, N_MARK,    n_num(mark))
+    pick(props, N_DATE_OPENED, n_date_ts(time.time()))
+    if N_TRADE_KEY in N_SCHEMA_PROPS:
+        pick(props, N_TRADE_KEY, n_rich(key))
 
     if page_id:
         r = await client.patch(
@@ -342,19 +393,27 @@ async def notion_upsert_open(client: httpx.AsyncClient, k: OpenKey, r: dict) -> 
         return page_id
 
 async def notion_close_page(client: httpx.AsyncClient, k: OpenKey, last_row: dict):
+    """Update the existing open page to Closed (same Trade Key)."""
     inst, side = k
+    key  = position_key(k)
+
     page_id = OPEN_PAGE_IDS.get(k)
     if not page_id:
-        page_id = await notion_query_open_page(client, inst, side)
+        # Prefer Trade Key
+        page_id, _ = await notion_find_by_key(client, key)
+        # Fallback
+        if not page_id:
+            page_id = await notion_query_open_page(client, inst, side)
         if not page_id:
             return
 
-    exitp = row_mark(last_row) or row_entry_price(last_row)
+    # Compute realized-ish pnl if derivable; otherwise leave to your formulas
+    mark = row_mark(last_row)  # just clear mark on close
     props = {}
     pick(props, N_STATUS, n_select(N_STATUS_CLOSED))
-    pick(props, N_EXIT, n_num(exitp))
     pick(props, N_MARK, n_num(None))
-    pick(props, N_DATE_CLOSE, n_date_iso(now_iso()))
+    pick(props, N_EXIT, n_num(mark))  # optional: if you want, pass last mark as proxy
+    pick(props, N_DATE_CLOSED, n_date_ts(time.time()))
 
     r = await client.patch(
         f"https://api.notion.com/v1/pages/{page_id}",
@@ -362,83 +421,45 @@ async def notion_close_page(client: httpx.AsyncClient, k: OpenKey, last_row: dic
         json={"properties": props},
     )
     r.raise_for_status()
+    # Remove from cache
     if k in OPEN_PAGE_IDS:
         del OPEN_PAGE_IDS[k]
 
-async def notion_refresh_marks(client: httpx.AsyncClient, keys: set[OpenKey]):
-    if not have_notion(): return
-    for k in keys:
-        page_id = OPEN_PAGE_IDS.get(k) or await notion_query_open_page(client, k[0], k[1])
-        if not page_id:
-            continue
-        r = LATEST_ROW.get(k, {})
-        mark = row_mark(r)
-        if mark is None:
-            continue
-        props = {}
-        pick(props, N_MARK, n_num(mark))
-        try:
-            resp = await client.patch(
-                f"https://api.notion.com/v1/pages/{page_id}",
-                headers={"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": N_VER},
-                json={"properties": props},
-            )
-            resp.raise_for_status()
-        except Exception:
-            await asyncio.sleep(0.2)
-
-# ========== Periodic table refresh ==========
-async def periodic_refresh(notion_client: Optional[httpx.AsyncClient]):
+# ========== Periodic Discord table ==========
+async def periodic_refresh():
     if PERIOD_HOURS <= 0:
         return
     interval = PERIOD_HOURS * 3600.0
-    await asyncio.sleep(interval)
-
+    await asyncio.sleep(interval)  # avoid double post at boot
     while True:
-        keys_now = set(LATEST_ROW.keys())
         if time.time() - LAST_POST_TIME >= 60:
-            await post_table(keys_now, force=True)
-        if have_notion() and notion_client is not None:
-            await notion_refresh_marks(notion_client, keys_now)
+            await post_table(set(LATEST_ROW.keys()), force=True)
         await asyncio.sleep(interval)
 
-# ========== Heartbeat ==========
-async def ws_heartbeat(ws: websockets.WebSocketClientProtocol, stop_evt: asyncio.Event):
-    # BloFin expects an application-level heartbeat like {"op":"ping"}
-    # Send every HEARTBEAT_SEC seconds until stop_evt is set
-    while not stop_evt.is_set():
-        try:
-            await ws.send(json.dumps({"op": "ping"}))
-        except Exception:
-            # let the main loop handle reconnect
-            return
-        await asyncio.sleep(HEARTBEAT_SEC)
-
-# ========== Main ==========
+# ========== Main loop ==========
 async def run():
-    notion_client: Optional[httpx.AsyncClient] = None
-    if have_notion():
-        notion_client = httpx.AsyncClient(timeout=20)
+    # background senders
+    asyncio.create_task(discord_sender())
+    asyncio.create_task(periodic_refresh())
+
+    backoff = 1
+    first_snapshot_done = False
+
+    # Notion client
+    notion_client = httpx.AsyncClient(timeout=20)
+    if NOTION_TOKEN and NOTION_DB_ID:
         try:
             await load_db_schema(notion_client)
             print("Notion DB schema detected.")
         except Exception as e:
-            print(f"Notion schema load failed: {e}")
-
-    asyncio.create_task(discord_sender())
-    asyncio.create_task(periodic_refresh(notion_client))
+            print("Notion schema load failed:", e)
 
     global LAST_OPEN_KEYS
-    backoff = 1
-    first_sent = False
 
     while True:
         try:
             print(f"Connecting to BloFin WS… ({WS_URL})")
-            # IMPORTANT: disable library-level pings; we do app-level ping
-            async with websockets.connect(
-                WS_URL, ping_interval=None, ping_timeout=None, max_size=5_000_000
-            ) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=5_000_000) as ws:
                 # login
                 await ws.send(json.dumps(ws_login_payload()))
                 login_ack = json.loads(await ws.recv())
@@ -450,86 +471,64 @@ async def run():
                     await ws.send(json.dumps(sub))
                 print("✅ Connected & subscribed (orders/positions).")
 
-                # start heartbeat
-                stop_hb = asyncio.Event()
-                hb_task = asyncio.create_task(ws_heartbeat(ws, stop_hb))
-
-                try:
-                    async for raw in ws:
-                        try:
-                            msg = json.loads(raw)
-                        except Exception:
-                            continue
-
-                        # ignore non-data frames
-                        if msg.get("event") in ("subscribe","unsubscribe","info","pong","welcome"):
-                            continue
-                        if msg.get("op") in ("pong",):  # some servers reply as {"op":"pong"}
-                            continue
-
-                        if not is_push(msg):
-                            continue
-                        if msg.get("arg", {}).get("channel") != "positions":
-                            continue
-
-                        rows = msg.get("data", [])
-                        keys_now = keys_from_rows(rows)
-
-                        added = sorted(list(keys_now - LAST_OPEN_KEYS))
-                        removed = sorted(list(LAST_OPEN_KEYS - keys_now))
-
-                        # Notion updates
-                        if have_notion() and notion_client is not None:
-                            for k in added:
-                                try:
-                                    await notion_upsert_open(notion_client, k, LATEST_ROW.get(k, {}))
-                                except Exception as e:
-                                    print(f"Notion upsert open failed {k}: {e}")
-                            for k in removed:
-                                last_row = LATEST_ROW.get(k, {})
-                                try:
-                                    await notion_close_page(notion_client, k, last_row)
-                                except Exception as e:
-                                    print(f"Notion close failed {k}: {e}")
-
-                        # Discord alerts
-                        if first_sent:
-                            if added:
-                                await send_alert(alert_block("🟢 New Trades", added))
-                            if removed:
-                                await send_alert(alert_block("🔴 Closed Trades", removed))
-                                for k in removed:
-                                    if k in LATEST_ROW:
-                                        del LATEST_ROW[k]
-
-                        # Table when set changes or first snapshot
-                        if (not first_sent) or added or removed:
-                            await post_table(keys_now, force=True)
-                            LAST_OPEN_KEYS = keys_now
-                            first_sent = True
-
-                finally:
-                    # stop heartbeat when leaving connection context
-                    stop_hb.set()
+                async for raw in ws:
                     try:
-                        hb_task.cancel()
+                        msg = json.loads(raw)
                     except Exception:
-                        pass
+                        continue
 
-        except (ConnectionClosedOK, ConnectionClosedError) as e:
-            # 1000 OK or other closure — reconnect quickly
-            print(f"WS closed: {e}. Reconnecting…")
+                    if msg.get("event") in ("subscribe","unsubscribe","info","pong","welcome"):
+                        continue
+                    if not is_push(msg):
+                        continue
+                    if msg.get("arg", {}).get("channel") != "positions":
+                        continue
+
+                    rows = msg.get("data", [])
+                    keys_now = keys_from_rows(rows)
+
+                    added   = sorted(list(keys_now - LAST_OPEN_KEYS))
+                    removed = sorted(list(LAST_OPEN_KEYS - keys_now))
+
+                    # Notion upserts/updates on *changes only*
+                    if NOTION_TOKEN and NOTION_DB_ID:
+                        for k in added:
+                            rrow = LATEST_ROW.get(k, {})
+                            try:
+                                await notion_upsert_open(notion_client, k, rrow)
+                            except Exception as e:
+                                print("Notion open upsert error:", e)
+                        for k in removed:
+                            rrow = LATEST_ROW.get(k, {})
+                            try:
+                                await notion_close_page(notion_client, k, rrow)
+                            except Exception as e:
+                                print("Notion close update error:", e)
+
+                    # Discord alerts (skip on the very first snapshot so we don't alert legacy positions)
+                    if first_snapshot_done:
+                        if added:
+                            await send_alert(alert_block("🟢 New Trades", added))
+                        if removed:
+                            await send_alert(alert_block("🔴 Closed Trades", removed))
+                            # purge cache for removed keys (kept long enough to render close alert)
+                            for k in removed:
+                                if k in LATEST_ROW:
+                                    del LATEST_ROW[k]
+
+                    # Post the table whenever the open/close set changes (or first snapshot)
+                    if (not first_snapshot_done) or added or removed:
+                        await post_table(keys_now, force=True)
+                        LAST_OPEN_KEYS = keys_now
+                        first_snapshot_done = True
+
+        except websockets.exceptions.ConnectionClosedOK as e:
+            print("WS closed OK:", e)
             await asyncio.sleep(2)
-            backoff = 1
-            continue
         except Exception as e:
-            print(f"WS loop error: {e}")
+            print("WS error:", e)
             await asyncio.sleep(min(backoff, 30))
             backoff = min(backoff * 2, 60)
-
-    # (never reached in a worker)
-    if notion_client is not None:
-        await notion_client.aclose()
 
 if __name__ == "__main__":
     asyncio.run(run())
