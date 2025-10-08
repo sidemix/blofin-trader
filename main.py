@@ -1,10 +1,13 @@
 # main.py
 # BloFin → Notion (plus optional Discord alerts)
-# - Detects OPEN/CLOSE from BloFin WS 'positions'
+# - Detect OPEN/CLOSE from BloFin WS 'positions'
 # - On OPEN: upsert a Notion page (Status=<OPEN_LABEL>, fill entry fields)
-# - On CLOSE: update same page (Status=<CLOSED_LABEL>, fill exit/PnL fields)
-# - Discord alerts are optional (set DISCORD_WEBHOOK_URL to enable)
-# - Auto-detects Notion property types (Status: status vs select) to avoid 400 errors.
+# - On CLOSE: update that page (Status=<CLOSED_LABEL>, exit/PnL)
+# - Discord alerts are optional (set DISCORD_WEBHOOK_URL)
+# - Robust Notion setup:
+#     * Accepts real database ID
+#     * If given a PAGE ID and NOTION_DATABASE_NAME, auto-finds the database by name
+#     * Detects Status property type (status vs select) to avoid 400s.
 
 import os
 import json
@@ -37,7 +40,8 @@ DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Notion
 NOTION_API_TOKEN = os.environ["NOTION_API_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]  # can be a real DB ID or (by mistake) a PAGE ID
+NOTION_DATABASE_NAME = os.getenv("NOTION_DATABASE_NAME", "")  # optional fallback search string
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
 
 # Notion property names (override via env if yours differ)
@@ -57,7 +61,7 @@ P_NET     = os.getenv("NOTION_PROP_NET", "Net Profit / Loss")
 P_ACCT    = os.getenv("NOTION_PROP_ACCOUNT", "Account")
 P_TRADEID = os.getenv("NOTION_PROP_TRADE_ID", "Trade ID")
 
-# Your label text in Notion for open/closed
+# Your labels for open/closed
 STATUS_OPEN_LABEL   = os.getenv("NOTION_STATUS_OPEN_LABEL", "Open")      # e.g., "1.Open"
 STATUS_CLOSED_LABEL = os.getenv("NOTION_STATUS_CLOSED_LABEL", "Closed")  # e.g., "3.Closed"
 
@@ -83,10 +87,8 @@ def parse_size(row: dict) -> float:
 
 def side_of(row: dict) -> str:
     s = str(row.get("positionSide") or "").lower()
-    if s in ("long", "buy"):
-        return "Buy"
-    if s in ("short", "sell"):
-        return "Short"
+    if s in ("long", "buy"):  return "Buy"
+    if s in ("short", "sell"): return "Short"
     sz = parse_size(row)
     return "Buy" if sz >= 0 else "Short"
 
@@ -98,11 +100,8 @@ def pct_signed(ratio) -> Optional[float]:
 
 # ---------- State ----------
 OpenKey = Tuple[str, str]  # (instId, "Buy"/"Short")
-
 LATEST_ROW: Dict[OpenKey, dict] = {}
 LAST_OPEN_KEYS: Set[OpenKey] = set()
-
-# mapping open position -> Notion page id
 OPEN_PAGE_IDS: Dict[OpenKey, str] = {}
 
 # ---------- Discord sender ----------
@@ -135,7 +134,7 @@ async def send_discord(msg: str):
     if DISCORD_WEBHOOK:
         await SEND_Q.put(msg)
 
-# ---------- Notion client & schema detection ----------
+# ---------- Notion client & schema ----------
 N_BASE = "https://api.notion.com/v1"
 N_HEADERS = {
     "Authorization": f"Bearer {NOTION_API_TOKEN}",
@@ -143,42 +142,96 @@ N_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Will be set at runtime after we read DB schema
-_STATUS_FILTER_KIND = "status"  # or "select"
+_STATUS_FILTER_KIND = "status"  # will be set to "status" or "select"
+_DB_ID: str = NOTION_DATABASE_ID  # resolved database id
+
+async def try_get_database(client: httpx.AsyncClient, dbid: str) -> Optional[dict]:
+    r = await client.get(f"{N_BASE}/databases/{dbid}", headers=N_HEADERS)
+    if r.status_code == 200:
+        return r.json()
+    return None
+
+async def search_database_by_name(client: httpx.AsyncClient, name: str) -> Optional[str]:
+    """Search for a database by name and return its id."""
+    payload = {
+        "query": name,
+        "filter": {"property": "object", "value": "database"},
+        "page_size": 10,
+    }
+    r = await client.post(f"{N_BASE}/search", headers=N_HEADERS, json=payload)
+    if r.status_code >= 400:
+        print("Notion search error:", r.status_code, r.text)
+        r.raise_for_status()
+    res = r.json()
+    for item in res.get("results", []):
+        title_parts = item.get("title", [])
+        title = "".join([t.get("plain_text", "") for t in title_parts]) if title_parts else ""
+        if title.strip().lower() == name.strip().lower():
+            return item["id"]
+    # fallback: return the first database result if exact name not found
+    if res.get("results"):
+        return res["results"][0]["id"]
+    return None
+
+async def resolve_database_id(client: httpx.AsyncClient) -> str:
+    """Ensure we have a valid database id; if a page id was provided, try to resolve via search."""
+    global _DB_ID
+    # First: try using provided ID as a database
+    db = await try_get_database(client, NOTION_DATABASE_ID)
+    if db:
+        _DB_ID = NOTION_DATABASE_ID
+        return _DB_ID
+
+    # If it failed (likely a page id), try to find DB by name if provided
+    if NOTION_DATABASE_NAME:
+        found = await search_database_by_name(client, NOTION_DATABASE_NAME)
+        if not found:
+            raise RuntimeError(
+                "The NOTION_DATABASE_ID you provided is not a database, and NOTION_DATABASE_NAME "
+                "did not match any shared database. Please provide a valid database ID or a correct name."
+            )
+        # Validate found id
+        db = await try_get_database(client, found)
+        if not db:
+            raise RuntimeError(
+                f"Found a candidate database '{NOTION_DATABASE_NAME}', but Notion refused it."
+            )
+        _DB_ID = found
+        return _DB_ID
+
+    # No name fallback available
+    raise RuntimeError(
+        "Provided NOTION_DATABASE_ID appears to be a PAGE, not a DATABASE. "
+        "Fix: open your Notion database → ••• → Copy link to view, and use the 32-char ID after the last '-' "
+        "(or set NOTION_DATABASE_NAME so I can search for it)."
+    )
 
 async def notion_get_db_schema(client: httpx.AsyncClient) -> dict:
-    r = await client.get(f"{N_BASE}/databases/{NOTION_DATABASE_ID}", headers=N_HEADERS)
-    # Helpful error print if misconfigured
+    r = await client.get(f"{N_BASE}/databases/{_DB_ID}", headers=N_HEADERS)
     if r.status_code >= 400:
         print("Notion DB schema error:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 
 async def init_schema_and_labels(client: httpx.AsyncClient):
-    """Detect whether P_STATUS is 'status' or 'select' and configure filters accordingly."""
+    """Resolve DB id and detect whether Status is 'status' or 'select'."""
     global _STATUS_FILTER_KIND
+    await resolve_database_id(client)
     schema = await notion_get_db_schema(client)
     props = schema.get("properties", {})
-
     status_prop = props.get(P_STATUS)
     if not status_prop:
         raise RuntimeError(f"Notion DB missing property '{P_STATUS}'. Check NOTION_PROP_STATUS.")
-
     ptype = status_prop.get("type")
-    if ptype == "status":
-        _STATUS_FILTER_KIND = "status"
-    elif ptype == "select":
-        _STATUS_FILTER_KIND = "select"
-    else:
-        # Fallback: treat like select
-        _STATUS_FILTER_KIND = "select"
+    _STATUS_FILTER_KIND = "status" if ptype == "status" else "select"
 
 def status_filter_equals(label: str) -> dict:
-    # Returns the correct filter snippet depending on property type
-    if _STATUS_FILTER_KIND == "status":
-        return {"property": P_STATUS, "status": {"equals": label}}
-    else:
-        return {"property": P_STATUS, "select": {"equals": label}}
+    return {"property": P_STATUS, _STATUS_FILTER_KIND: {"equals": label}} if _STATUS_FILTER_KIND == "status" \
+        else {"property": P_STATUS, "select": {"equals": label}}
+
+def status_set_value(label: str) -> dict:
+    return {_STATUS_FILTER_KIND: {"name": label}} if _STATUS_FILTER_KIND == "status" \
+        else {"select": {"name": label}}
 
 def direction_filter_equals(label: str) -> dict:
     # Direction is expected to be a select
@@ -188,7 +241,6 @@ def title_filter_equals(symbol: str) -> dict:
     return {"property": P_TITLE, "title": {"equals": symbol}}
 
 async def notion_query_open_page(client: httpx.AsyncClient, symbol: str, direction: str) -> Optional[str]:
-    """Return an existing OPEN page id for (symbol, direction), else None."""
     payload = {
         "filter": {
             "and": [
@@ -200,7 +252,7 @@ async def notion_query_open_page(client: httpx.AsyncClient, symbol: str, directi
         "page_size": 1
     }
     r = await client.post(
-        f"{N_BASE}/databases/{NOTION_DATABASE_ID}/query",
+        f"{N_BASE}/databases/{_DB_ID}/query",
         headers=N_HEADERS,
         json=payload,
     )
@@ -223,11 +275,10 @@ async def notion_create_open_page(client: httpx.AsyncClient, key: OpenKey, row: 
     trade_id = f"{symbol}|{direction}|{open_ts}"
 
     data = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
+        "parent": {"database_id": _DB_ID},
         "properties": {
             P_TITLE:   {"title": [{"text": {"content": symbol}}]},
-            P_STATUS:  ({_STATUS_FILTER_KIND: {"name": STATUS_OPEN_LABEL}} if _STATUS_FILTER_KIND == "status"
-                        else {"select": {"name": STATUS_OPEN_LABEL}}),
+            P_STATUS:  status_set_value(STATUS_OPEN_LABEL),
             P_DIR:     {"select": {"name": direction}},
             P_LEV:     {"number": float(lev) if lev not in (None, "") else None},
             P_QTY:     {"number": qty},
@@ -247,13 +298,12 @@ async def notion_create_open_page(client: httpx.AsyncClient, key: OpenKey, row: 
 
 async def notion_update_close_page(client: httpx.AsyncClient, page_id: str, key: OpenKey, row: dict):
     exit_px = row.get("markPrice") or row.get("lastPrice") or row.get("price")
-    cpnl    = row.get("unrealizedPnl")      # last seen before disappearance
+    cpnl    = row.get("unrealizedPnl")
     pct     = pct_signed(row.get("unrealizedPnlRatio"))
     net     = cpnl
 
     props = {
-        P_STATUS:  ({_STATUS_FILTER_KIND: {"name": STATUS_CLOSED_LABEL}} if _STATUS_FILTER_KIND == "status"
-                    else {"select": {"name": STATUS_CLOSED_LABEL}}),
+        P_STATUS:  status_set_value(STATUS_CLOSED_LABEL),
         P_EXIT:    {"number": float(exit_px) if exit_px not in (None, "") else None},
         P_CLOSED:  {"date": {"start": now_iso()}},
         P_CPNL:    {"number": float(cpnl) if cpnl not in (None, "") else None},
@@ -278,7 +328,7 @@ async def notion_load_existing_opens(client: httpx.AsyncClient):
             payload["start_cursor"] = start_cursor
 
         r = await client.post(
-            f"{N_BASE}/databases/{NOTION_DATABASE_ID}/query",
+            f"{N_BASE}/databases/{_DB_ID}/query",
             headers=N_HEADERS,
             json=payload,
         )
@@ -333,18 +383,17 @@ def keys_from_rows(rows: List[dict]) -> Set[OpenKey]:
             continue
         key = (str(r.get("instId")), side_of(r))
         keys.add(key)
-        LATEST_ROW[key] = r  # keep freshest row
+        LATEST_ROW[key] = r
     return keys
 
 # ---------- Main loop ----------
 async def run():
-    # Start Discord worker (no-op if webhook not set)
+    # Start Discord worker
     asyncio.create_task(discord_sender())
 
     async with httpx.AsyncClient(timeout=15) as notion_client:
-        # 1) Detect schema (sets _STATUS_FILTER_KIND)
+        # Resolve db id & schema, then pre-load open pages
         await init_schema_and_labels(notion_client)
-        # 2) Prefill any open pages (so restarts don't duplicate)
         await notion_load_existing_opens(notion_client)
 
         backoff = 1
@@ -381,9 +430,8 @@ async def run():
                         added = sorted(list(keys_now - LAST_OPEN_KEYS))
                         removed = sorted(list(LAST_OPEN_KEYS - keys_now))
 
-                        # Skip alerts on first snapshot (they'd be historical)
                         if not first_snapshot:
-                            # --- NEW TRADES ---
+                            # New trades
                             for key in added:
                                 symbol, direction = key
                                 page_id = await notion_query_open_page(notion_client, symbol, direction)
@@ -397,7 +445,7 @@ async def run():
                                 )
                                 await send_discord(f"🟢 New trade: **{symbol}** {direction} @ avg {fnum(avg, 6)}")
 
-                            # --- CLOSED TRADES ---
+                            # Closed trades
                             for key in removed:
                                 last_row = LATEST_ROW.get(key, {})
                                 page_id = OPEN_PAGE_IDS.get(key)
@@ -412,7 +460,6 @@ async def run():
                         first_snapshot = False
 
             except Exception as e:
-                # helpful log for debugging Notion/BloFin issues
                 print("Loop error:", repr(e))
                 await asyncio.sleep(min(backoff, 30))
                 backoff = min(backoff * 2, 60)
