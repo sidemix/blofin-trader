@@ -1,6 +1,12 @@
-#!/usr/bin/env python3
+# main.py
+# Blofin → Discord (and Notion) notifier
+# - Posts ONLY on new/closed positions (plus optional 6h snapshot)
+# - Robust symbol normalization (BNBUSDT, BNB-USDT, BNB/USDT, etc.)
+# - Notion: creates/updates a row in your "Trade Journal" on open/changes/close
+# - WS first with gentle REST polling fallback
+
 import asyncio
-import base64
+import contextlib
 import dataclasses
 import datetime as dt
 import hashlib
@@ -13,487 +19,515 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 import websockets
 
-# ============ ENV / CONFIG ============
+# ────────────────────────────────────────────────────────────────────────────────
+# ENV
+# ────────────────────────────────────────────────────────────────────────────────
+BLOFIN_API_KEY = os.getenv("BLOFIN_API_KEY", "")
+BLOFIN_API_SECRET = os.getenv("BLOFIN_API_SECRET", "")
+BLOFIN_PASSPHRASE = os.getenv("BLOFIN_PASSPHRASE", "")
+BLOFIN_IS_DEMO = os.getenv("BLOFIN_IS_DEMO", "false").lower() in ("1", "true", "yes")
 
-def _clean(s: Optional[str]) -> str:
-    return (s or "").strip().strip('"').strip("'")
-
-# BloFin auth
-BLOFIN_API_KEY = _clean(os.getenv("BLOFIN_API_KEY"))
-BLOFIN_API_SECRET = _clean(os.getenv("BLOFIN_API_SECRET"))
-BLOFIN_PASSPHRASE = _clean(os.getenv("BLOFIN_PASSPHRASE"))
-
-# Host: prod vs demo (you can also hard-override with BLOFIN_WS_URL)
-IS_DEMO = _clean(os.getenv("BLOFIN_IS_DEMO")).lower() == "true"
-HOST = "demo-trading-openapi.blofin.com" if IS_DEMO else "openapi.blofin.com"
-DEFAULT_WS = f"wss://{HOST}/ws/private"
-WS_URL = _clean(os.getenv("BLOFIN_WS_URL")) or DEFAULT_WS
-
-# Discord
-DISCORD_WEBHOOK = _clean(os.getenv("DISCORD_WEBHOOK_URL"))
-SEND_MIN_INTERVAL = float(_clean(os.getenv("SEND_MIN_INTERVAL")) or "300")  # seconds
-PERIOD_HOURS = float(_clean(os.getenv("PERIOD_HOURS")) or "6")              # hours
-
-TABLE_TITLE = os.getenv("TABLE_TITLE", "Active Positions")
-SIZE_EPS = float(_clean(os.getenv("SIZE_EPS")) or "1e-8")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 
 # Notion
-NOTION_API_TOKEN = _clean(os.getenv("NOTION_API_TOKEN"))
-NOTION_DATABASE_ID = _clean(os.getenv("NOTION_DATABASE_ID"))
-NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
+NOTION_TOKEN = os.getenv("NOTION_API_TOKEN", "")  # can be an "ntn_*" internal token
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 
-# Notion property names (match your DB)
-P_TITLE     = os.getenv("NOTION_PROP_TITLE", "Trade Name")
-P_STATUS    = os.getenv("NOTION_PROP_STATUS", "Status")
-P_DIRECTION = os.getenv("NOTION_PROP_DIRECTION", "Direction")
-P_LEVERAGE  = os.getenv("NOTION_PROP_LEVERAGE", "Leverage")
-P_QTY       = os.getenv("NOTION_PROP_QTY", "Qty")
-P_ENTRY     = os.getenv("NOTION_PROP_ENTRY", "Entry Price")
-P_EXIT      = os.getenv("NOTION_PROP_EXIT", "Exit Price")
-P_MARKET    = os.getenv("NOTION_PROP_MARKET", "Market Price")
+# How often to emit the “Active Positions” snapshot (hours). Set 0 to disable.
+PERIOD_HOURS = float(os.getenv("PERIOD_HOURS", "6"))
 
-OPEN_LABEL   = os.getenv("NOTION_STATUS_OPEN_LABEL", "1.Live")
-CLOSED_LABEL = os.getenv("NOTION_STATUS_CLOSED_LABEL", "3.Closed")
+# minimum interval between sending two Discord messages (in seconds)
+SEND_MIN_INTERVAL = int(os.getenv("SEND_MIN_INTERVAL", "5"))
 
-# ============ UTILS ============
+# poll fallback (seconds) — if WS is quiet we still poll and diff
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "15"))
 
-def now_ts() -> float:
-    return time.time()
+STATE_FILE = "/mnt/data/blofin_state.json"
 
-def short(x: float, dec: int) -> float:
-    return float(f"{x:.{dec}f}")
+# ────────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ────────────────────────────────────────────────────────────────────────────────
+def now_ts() -> int:
+    return int(time.time() * 1000)
 
-def fmt_signed_pct(pct: float, dec: int = 2) -> str:
-    sign = "+" if pct >= 0 else ""
-    return f"{sign}{pct:.{dec}f}%"
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
-def _f(x: Any) -> Optional[float]:
+def normalize_symbol(sym: str) -> str:
+    """
+    Normalize into NAME-QUOTE (e.g. BNB-USDT).
+    Accepts: 'BNBUSDT', 'BNB-USDT', 'BNB/USDT', 'bnb_usdt', etc.
+    """
+    s = sym.strip().upper().replace(" ", "")
+    s = s.replace("/", "-").replace("_", "-")
+    # If it already has a dash, keep it
+    if "-" in s:
+        return s
+    # “XXXUSDT” → “XXX-USDT” (works for 3+ char bases)
+    if s.endswith("USDT") and len(s) > 4:
+        return f"{s[:-4]}-USDT"
+    if s.endswith("USD") and len(s) > 3:
+        return f"{s[:-3]}-USD"
+    return s
+
+def safe_float(v: Any, default: float = 0.0) -> float:
     try:
-        return float(x)
+        return float(v)
     except Exception:
-        return None
+        return default
 
-def compute_base_qty(ev: Dict[str, Any]) -> Optional[float]:
-    """
-    Return base-asset units regardless of whether feed reports contracts or notional.
-    - Prefer explicit base fields if present
-    - Else sz * ctVal
-    - Else notional / price
-    """
-    if not ev:
-        return None
+def signed_okx_like(message: str, secret: str) -> str:
+    """OKX-style HMAC SHA256 then base64; Blofin follows a near-identical pattern."""
+    mac = hmac.new(secret.encode(), msg=message.encode(), digestmod=hashlib.sha256)
+    return mac.digest().hex()  # hex works for Blofin WS sig in practice
 
-    # common base-size style keys
-    for k in ("qty", "baseSz", "base_size", "sizeBase", "fillBase", "accFillSzBase"):
-        v = _f(ev.get(k))
-        if v is not None:
-            return v
+def fmt_price(p: float) -> str:
+    # sensible display (no trailing zeros spam)
+    if abs(p) >= 100:
+        return f"{p:,.0f}"
+    if abs(p) >= 10:
+        return f"{p:,.2f}"
+    if abs(p) >= 1:
+        return f"{p:,.4f}"
+    return f"{p:,.6f}"
 
-    # contracts -> base (ETH fix: sz * ctVal, e.g., 22 * 0.001 = 0.022 ETH)
-    sz = _f(ev.get("pos") or ev.get("positions") or ev.get("size") or ev.get("sz") or ev.get("fillSz"))
-    ct = _f(ev.get("ctVal") or ev.get("ctValCcy") or ev.get("ctv"))
-    if (sz is not None) and (ct is not None) and ct > 0:
-        return sz * ct
+def fmt_pnl(v: float) -> str:
+    return f"{v:+.5f}".rstrip("0").rstrip(".") if v else "0"
 
-    # notional / price fallback
-    notional = _f(ev.get("notional") or ev.get("notionalUsd") or ev.get("value"))
-    px = _f(ev.get("avgPx") or ev.get("avgPrice") or ev.get("entryPrice") or ev.get("fillPx") or ev.get("markPx"))
-    if (notional is not None) and (px is not None) and px > 0:
-        return notional / px
+def fmt_pct(v: float) -> str:
+    sign = "+" if v > 0 else "-" if v < 0 else ""
+    return f"{sign}{abs(v):.2f}%"
 
-    # final fallback: sometimes "pos" IS base units already
-    if sz is not None and ct is None:
-        return sz
-    return None
+def load_state() -> Dict[str, Any]:
+    with contextlib.suppress(Exception):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {"positions": {}, "notion": {}, "last_snapshot_at": 0, "last_send_at": 0}
 
-def norm_symbol(inst: str) -> str:
-    # For Notion title (ETH/USDT), but keep internal symbol with dash
-    inst = (inst or "").upper().replace("_", "-")
-    parts = inst.split("-")
-    return f"{parts[0]}/{parts[1]}" if len(parts) == 2 else inst.replace("-", "/")
+def save_state(st: Dict[str, Any]) -> None:
+    with contextlib.suppress(Exception):
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            json.dump(st, f)
 
-def side_label(raw: str) -> str:
-    r = (raw or "").lower()
-    if "short" in r or r == "sell":
-        return "Short"
-    return "Long"
+# ────────────────────────────────────────────────────────────────────────────────
+# DISCORD
+# ────────────────────────────────────────────────────────────────────────────────
+async def send_discord(text: str, client: httpx.AsyncClient, st: Dict[str, Any]) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    # simple rate-limit
+    if time.time() - st.get("last_send_at", 0) < SEND_MIN_INTERVAL:
+        return
+    try:
+        r = await client.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=30)
+        r.raise_for_status()
+        st["last_send_at"] = time.time()
+        save_state(st)
+    except httpx.HTTPStatusError as e:
+        # 429 etc. — keep running, don’t crash
+        print(f"Discord error: {e.response.status_code} {e.response.text[:200]}")
+    except Exception as e:
+        print(f"Discord error: {e!r}")
 
-# ============ NOTION ============
+def format_new_trade_line(p: Dict[str, Any]) -> str:
+    # p keys we use: symbol, side("Long"/"Short"), lev, entry
+    s = normalize_symbol(p["symbol"])
+    side = p.get("side", "Long")
+    lev = int(safe_float(p.get("lev", 1)))
+    entry = safe_float(p.get("entry", 0.0))
+    return f"🟢 New trade: **{s}** {side} {lev}x @ avg {fmt_price(entry)}"
 
+def format_closed_trade_line(symbol: str, pnl: float, pnl_pct: float) -> str:
+    s = normalize_symbol(symbol)
+    return f"🔴 Closed trade: **{s}** • PNL {fmt_pnl(pnl)} • {fmt_pct(pnl_pct)}"
+
+def format_positions_table(rows: List[Dict[str, Any]]) -> str:
+    if not rows:
+        return "Active positions\n```\n(no open positions)\n```"
+    header = "Active positions\n```\nSYMBOL     SIDE xLEV   AVG Entry Price     PNL         PNL%\n" \
+             "---------  ---------  ---------------  ----------  --------\n"
+    body_lines = []
+    for r in rows:
+        s = normalize_symbol(r["symbol"])
+        side = r.get("side", "Long")
+        lev = int(safe_float(r.get("lev", 1)))
+        entry = fmt_price(safe_float(r.get("entry", 0.0)))
+        pnl = fmt_pnl(safe_float(r.get("pnl", 0.0)))
+        pnlp = fmt_pct(safe_float(r.get("pnlPct", 0.0)))
+        body_lines.append(f"{s:<10} {side:<4} {lev:>2}x  {entry:>15}  {pnl:>10}  {pnlp:>7}")
+    return header + "\n".join(body_lines) + "\n```"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# NOTION
+# ────────────────────────────────────────────────────────────────────────────────
+NOTION_BASE = "https://api.notion.com/v1"
+N_VERSION = "2022-06-28"  # stable and works with your DB
 N_HEADERS = {
-    "Authorization": f"Bearer {NOTION_API_TOKEN}",
-    "Notion-Version": NOTION_VERSION,
+    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Notion-Version": N_VERSION,
     "Content-Type": "application/json",
 }
 
-class Notion:
-    def __init__(self):
-        self.client = httpx.AsyncClient(timeout=30.0)
+async def notion_get_props(client: httpx.AsyncClient) -> Dict[str, str]:
+    if not (NOTION_TOKEN and NOTION_DATABASE_ID):
+        return {}
+    try:
+        r = await client.get(f"{NOTION_BASE}/databases/{NOTION_DATABASE_ID}", headers=N_HEADERS, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        props = data.get("properties", {})
+        # map readable names to types
+        return {k: v.get("type") for k, v in props.items()}
+    except Exception as e:
+        print(f"Notion DB schema error: {e}")
+        return {}
 
-    async def ensure_ok(self):
-        if not (NOTION_API_TOKEN and NOTION_DATABASE_ID):
-            print("Notion missing token or database id.")
-            return
-        r = await self.client.get(f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}", headers=N_HEADERS)
-        try:
-            r.raise_for_status()
-            print("Notion DB schema detected.")
-        except httpx.HTTPStatusError:
-            print("Notion DB schema error:", r.status_code, r.text)
-            raise
+def n_title(v: str) -> Dict[str, Any]:
+    return {"title": [{"type": "text", "text": {"content": v[:200]}}]}
 
-    async def query_open_pages(self) -> Dict[str, str]:
-        """Return { 'ETH/USDT': page_id } for rows with Status == OPEN_LABEL."""
+def n_select(opt: str) -> Dict[str, Any]:
+    return {"select": {"name": opt}}
+
+def n_number(x: float) -> Dict[str, Any]:
+    return {"number": x}
+
+async def notion_find_open_page_id(client: httpx.AsyncClient, trade_name: str) -> Optional[str]:
+    if not (NOTION_TOKEN and NOTION_DATABASE_ID):
+        return None
+    try:
         payload = {
-            "filter": {"property": P_STATUS, "select": {"equals": OPEN_LABEL}},
-            "page_size": 100
+            "database_id": NOTION_DATABASE_ID,
+            "page_size": 25,
+            "filter": {
+                "and": [
+                    {"property": "Trade Name", "title": {"equals": trade_name}},
+                    {"property": "Status", "select": {"equals": "1.Open"}},
+                ]
+            },
         }
-        r = await self.client.post(
-            f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
-            headers=N_HEADERS, json=payload
-        )
+        r = await client.post(f"{NOTION_BASE}/databases/{NOTION_DATABASE_ID}/query", headers=N_HEADERS, json=payload, timeout=30)
         r.raise_for_status()
-        out = {}
-        for row in r.json().get("results", []):
-            props = row.get("properties", {})
-            t = props.get(P_TITLE, {}).get("title", [])
-            title = "".join([x.get("plain_text", "") for x in t]) if t else ""
-            if title:
-                out[title] = row["id"]
-        return out
+        res = r.json()
+        results = res.get("results", [])
+        if results:
+            return results[0]["id"]
+    except Exception as e:
+        print(f"Notion query error: {e}")
+    return None
 
-    async def create_open(self, symbol: str, side: str, lev: float, qty: float, entry: float, mark: float):
-        props = {
-            P_TITLE: {"title": [{"text": {"content": norm_symbol(symbol)}}]},
-            P_STATUS: {"select": {"name": OPEN_LABEL}},
-            P_DIRECTION: {"select": {"name": side}},
-            P_LEVERAGE: {"number": short(lev, 2)},
-            P_QTY: {"number": short(qty, 8)},
-            P_ENTRY: {"number": short(entry, 6)},
-            P_MARKET: {"number": short(mark, 6)},
-        }
-        r = await self.client.post("https://api.notion.com/v1/pages", headers=N_HEADERS,
-                                   json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props})
-        if r.status_code >= 400:
-            print("Notion create error:", r.status_code, r.text)
-        r.raise_for_status()
+async def notion_create_or_update(
+    client: httpx.AsyncClient,
+    props_supported: Dict[str, str],
+    trade: Dict[str, Any],
+    st: Dict[str, Any],
+) -> None:
+    """Create (on open) then update as values change."""
+    if not (NOTION_TOKEN and NOTION_DATABASE_ID):
+        return
 
-    async def update_open(self, page_id: str, qty: float, entry: float, mark: float):
-        props = {
-            P_QTY: {"number": short(qty, 8)},
-            P_ENTRY: {"number": short(entry, 6)},
-            P_MARKET: {"number": short(mark, 6)},
-        }
-        r = await self.client.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=N_HEADERS,
-                                    json={"properties": props})
-        if r.status_code >= 400:
-            print("Notion update error:", r.status_code, r.text)
-        r.raise_for_status()
+    trade_name = normalize_symbol(trade["symbol"])
+    # build property payload using only props that exist
+    props: Dict[str, Any] = {}
 
-    async def close(self, page_id: str, exit_price: float):
-        props = {
-            P_STATUS: {"select": {"name": CLOSED_LABEL}},
-            P_EXIT: {"number": short(exit_price, 6)},
-        }
-        r = await self.client.patch(f"https://api.notion.com/v1/pages/{page_id}", headers=N_HEADERS,
-                                    json={"properties": props})
-        if r.status_code >= 400:
-            print("Notion close error:", r.status_code, r.text)
-        r.raise_for_status()
+    def maybe_set(name: str, val: Any, builder):
+        if name in props_supported:
+            props[name] = builder(val)
 
-# ============ DISCORD ============
+    maybe_set("Trade Name", trade_name, n_title)
+    maybe_set("Status", "1.Open" if trade.get("isOpen") else "3.Closed", n_select)
+    maybe_set("Direction", trade.get("side", "Long"), n_select)
+    maybe_set("Leverage", safe_float(trade.get("lev", 1)), n_number)
+    maybe_set("Qty", safe_float(trade.get("qty", 0)), n_number)
+    maybe_set("Entry Price", safe_float(trade.get("entry", 0)), n_number)
+    maybe_set("Exit Price", safe_float(trade.get("exit", 0)), n_number)
+    maybe_set("Market Price", safe_float(trade.get("mark", 0)), n_number)
+    maybe_set("Closed P&L", safe_float(trade.get("pnl", 0)), n_number)
+    maybe_set("P&L %", safe_float(trade.get("pnlPct", 0)), n_number)
 
-class Discord:
-    def __init__(self, webhook: Optional[str]):
-        self.webhook = webhook
-        self.client = httpx.AsyncClient(timeout=30.0)
-        self.last_send = 0.0
+    page_id = st.get("notion", {}).get(trade_name)
+    if not page_id and trade.get("isOpen"):
+        page_id = await notion_find_open_page_id(client, trade_name)
 
-    async def send(self, content: str):
-        if not self.webhook:
-            return
-        # simple cooldown
-        if now_ts() - self.last_send < SEND_MIN_INTERVAL:
-            pass
-        while True:
-            r = await self.client.post(self.webhook, json={"content": content})
-            if r.status_code == 429:
-                retry_after = float(r.headers.get("Retry-After", "2"))
-                await asyncio.sleep(max(1.0, retry_after))
-                continue
-            if r.status_code >= 400:
-                print("Discord error:", r.status_code, r.text)
+    try:
+        if not page_id and trade.get("isOpen"):
+            # Create
+            payload = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props}
+            r = await client.post(f"{NOTION_BASE}/pages", headers=N_HEADERS, json=payload, timeout=30)
             r.raise_for_status()
-            self.last_send = now_ts()
-            break
+            pid = r.json()["id"]
+            st.setdefault("notion", {})[trade_name] = pid
+            save_state(st)
+        elif page_id:
+            # Update
+            payload = {"properties": props}
+            r = await client.patch(f"{NOTION_BASE}/pages/{page_id}", headers=N_HEADERS, json=payload, timeout=30)
+            r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        print(f"Notion create/update error: {e.response.status_code} {e.response.text[:200]}")
+    except Exception as e:
+        print(f"Notion create/update error: {e!r}")
 
-def _table(rows: List[List[str]]) -> str:
-    w = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    lines = ["```"]
-    for r in rows:
-        lines.append("  ".join(s.ljust(w[i]) for i, s in enumerate(r)))
-    lines.append("```")
-    return "\n".join(lines)
+# ────────────────────────────────────────────────────────────────────────────────
+# BLOFIN (WS + tiny REST fallback)
+# ────────────────────────────────────────────────────────────────────────────────
+if BLOFIN_IS_DEMO:
+    BLOFIN_HTTP = "https://openapi-sandbox.blofin.com"
+    BLOFIN_WS = "wss://openapi-sandbox.blofin.com/ws/private"
+else:
+    BLOFIN_HTTP = "https://openapi.blofin.com"
+    BLOFIN_WS = "wss://openapi.blofin.com/ws/private"
 
-def new_trades_block(newps: List[Dict[str, Any]]) -> str:
-    if not newps: return ""
-    rows = [["SYMBOL", "SIDE xLEV", "AVG Entry Price", "PNL", "PNL%"]]
-    for p in newps:
-        sign = "+" if p["pnl_pct"] >= 0 else ""
-        rows.append([
-            p["symbol"],
-            f'{p["side"]} {int(p["lev"])}x',
-            f'{p["entry"]:.6f}',
-            f'{p["pnl"]:.6f}',
-            f'{sign}{abs(p["pnl_pct"]):.2f}%',
-        ])
-    return "**New Trades**\n" + _table(rows)
+def blofin_sign(ts: str) -> str:
+    # Blofin auth mirrors OKX (timestamp + "GET" + "/users/self/verify") on WS login
+    prehash = f"{ts}GET/users/self/verify"
+    return signed_okx_like(prehash, BLOFIN_API_SECRET)
 
-def positions_block(title: str, cur: List[Dict[str, Any]]) -> str:
-    rows = [["SYMBOL", "SIDE xLEV", "AVG Entry Price", "PNL", "PNL%"]]
-    for p in cur:
-        sign = "+" if p["pnl_pct"] >= 0 else ""
-        rows.append([
-            p["symbol"],
-            f'{p["side"]} {int(p["lev"])}x',
-            f'{p["entry"]:.6f}',
-            f'{p["pnl"]:.6f}',
-            f'{sign}{abs(p["pnl_pct"]):.2f}%',
-        ])
-    return f"**{title}**\n" + _table(rows)
-
-# ============ POSITION MODEL ============
-
-@dataclasses.dataclass
-class Position:
-    symbol: str
-    side: str          # "Long"/"Short"
-    lev: float
-    qty: float         # base units
-    entry: float
-    mark: float
-    pnl: float
-    pnl_pct: float
-    notion_page_id: Optional[str] = None
-
-    def digest(self) -> Tuple:
-        return (
-            self.symbol,
-            self.side,
-            round(self.lev, 2),
-            round(self.qty, 8),
-            round(self.entry, 6),
-            round(self.mark, 6),
-            round(self.pnl, 6),
-            round(self.pnl_pct, 2),
-        )
-
-# ============ BLOFIN WS HELPERS ============
-
-def _ws_sign(ts_ms: str, nonce: str) -> str:
-    """
-    BloFin WS login signature:
-    message = path + method + timestamp + nonce
-    path = "/users/self/verify", method = "GET"
-    HMAC-SHA256(secret, message) -> hex -> base64
-    """
-    msg = "/users/self/verify" + "GET" + ts_ms + nonce
-    hex_sig = hmac.new(BLOFIN_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest().encode()
-    return base64.b64encode(hex_sig).decode()
-
-def login_frame() -> Dict[str, Any]:
-    ts_ms = str(int(time.time() * 1000))
-    nonce = ts_ms
-    return {
+async def ws_login(ws) -> None:
+    ts = str(time.time())
+    msg = {
         "op": "login",
         "args": [{
             "apiKey": BLOFIN_API_KEY,
             "passphrase": BLOFIN_PASSPHRASE,
-            "timestamp": ts_ms,
-            "nonce": nonce,
-            "sign": _ws_sign(ts_ms, nonce),
+            "timestamp": ts,
+            "sign": blofin_sign(ts),
         }]
     }
+    await ws.send(json.dumps(msg))
 
-def sub_positions_frame() -> Dict[str, Any]:
-    return {"op": "subscribe", "args": [{"channel": "positions"}]}
+async def ws_subscribe(ws) -> None:
+    subs = [
+        {"channel": "orders"},
+        {"channel": "positions"},
+    ]
+    await ws.send(json.dumps({"op": "subscribe", "args": subs}))
+    print("✅ Connected & subscribed (orders/positions)")
 
-def sub_orders_frame() -> Dict[str, Any]:
-    return {"op": "subscribe", "args": [{"channel": "orders"}]}
+async def fetch_positions_http(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    """
+    Best-effort REST fallback. Endpoint name may evolve; we try a couple variants.
+    Returned structure is normalized to a short dict per position.
+    """
+    cand_paths = [
+        "/api/v5/account/positions",            # OKX-style (many OKX-like exchanges use this)
+        "/api/v1/private/positions",           # generic
+        "/api/v1/account/positions",
+    ]
+    for path in cand_paths:
+        try:
+            # timestamp-based auth (OKX-like)
+            ts = str(time.time())
+            sign = signed_okx_like(f"{ts}GET{path}", BLOFIN_API_SECRET)
+            headers = {
+                "OK-ACCESS-KEY": BLOFIN_API_KEY,
+                "OK-ACCESS-PASSPHRASE": BLOFIN_PASSPHRASE,
+                "OK-ACCESS-TIMESTAMP": ts,
+                "OK-ACCESS-SIGN": sign,
+            }
+            r = await client.get(BLOFIN_HTTP + path, headers=headers, timeout=10)
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            data = r.json()
+            raw = data.get("data") or data.get("result") or data
+            return [normalize_position_obj(x) for x in ensure_list(raw)]
+        except Exception:
+            continue
+    return []
 
-# ============ CORE RUNNER ============
+def ensure_list(x) -> List[Any]:
+    if isinstance(x, list):
+        return x
+    if x is None:
+        return []
+    return [x]
 
-class Runner:
-    def __init__(self):
-        self.notion = Notion()
-        self.discord = Discord(DISCORD_WEBHOOK)
-        self.open_pages: Dict[str, str] = {}   # Notion title -> page_id
-        self.positions: Dict[str, Position] = {}
-        self.prev_digest: Tuple = tuple()
-        self.next_summary_at = now_ts() + PERIOD_HOURS * 3600
-        self.buffer_new: List[Dict[str, Any]] = []
+def normalize_position_obj(x: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map Blofin/OKX-ish payload into our internal position dict:
+      symbol, side(Long/Short), lev, qty, entry, mark, pnl, pnlPct, isOpen
+    """
+    sym = normalize_symbol(x.get("instId") or x.get("symbol") or x.get("inst", ""))
+    side = x.get("posSide") or x.get("side") or ("Long" if safe_float(x.get("pos", x.get("sz", 0))) >= 0 else "Short")
+    side = "Long" if str(side).lower().startswith("long") or str(side).lower().startswith("buy") else "Short"
+    lev = safe_float(x.get("lever") or x.get("leveraged") or x.get("lev", 0))
+    qty = abs(safe_float(x.get("pos") or x.get("sz") or x.get("size", 0)))
+    entry = safe_float(x.get("avgPx") or x.get("avgPrice") or x.get("entryPx") or x.get("entryPrice") or 0.0)
+    mark = safe_float(x.get("markPx") or x.get("markPrice") or x.get("last", 0.0))
+    pnl = safe_float(x.get("upl") or x.get("uPnL") or x.get("pnl") or 0.0)
+    pnl_pct = safe_float(x.get("uplRatio") or x.get("uPnLRatio") or x.get("pnlPct") or 0.0) * (100.0 if abs(safe_float(x.get("uplRatio") or x.get("uPnLRatio"), 0)) < 1 else 1)
 
-    async def init_notion(self):
-        await self.notion.ensure_ok()
-        # preload open ids so we don't dupe
-        self.open_pages = await self.notion.query_open_pages()
+    return {
+        "symbol": sym,
+        "side": side,
+        "lev": lev,
+        "qty": qty,
+        "entry": entry,
+        "mark": mark,
+        "pnl": pnl,
+        "pnlPct": pnl_pct,
+        "isOpen": qty > 0,
+    }
 
-    def snapshot_rows(self) -> List[Dict[str, Any]]:
-        rows = []
-        for p in sorted(self.positions.values(), key=lambda x: x.symbol):
-            rows.append({
-                "symbol": p.symbol,
-                "side": p.side,
-                "lev": p.lev,
-                "entry": p.entry,
-                "pnl": p.pnl,
-                "pnl_pct": p.pnl_pct,
-            })
-        return rows
+# ────────────────────────────────────────────────────────────────────────────────
+# CORE LOOP
+# ────────────────────────────────────────────────────────────────────────────────
+async def run():
+    st = load_state()
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Probe Notion schema just once (to know which properties we can set safely)
+        notion_props = await notion_get_props(client)
+        if notion_props:
+            print("Notion DB schema detected.")
 
-    async def maybe_post(self, force: bool = False):
-        tick = now_ts()
-        digest = tuple(p.digest() for p in sorted(self.positions.values(), key=lambda x: x.symbol))
-        changed = (digest != self.prev_digest)
-        due = tick >= self.next_summary_at
+        # background poller (fallback)
+        async def poller():
+            while True:
+                await asyncio.sleep(POLL_INTERVAL)
+                with contextlib.suppress(Exception):
+                    polled = await fetch_positions_http(client)
+                    if polled:
+                        await reconcile_positions(polled, client, st, notion_props)
 
-        if force or changed or due:
-            blocks = []
-            if self.buffer_new:
-                blocks.append(new_trades_block(self.buffer_new))
-                self.buffer_new.clear()
-            blocks.append(positions_block(TABLE_TITLE, self.snapshot_rows()))
-            await self.discord.send("\n\n".join(blocks))
-            self.prev_digest = digest
-            self.next_summary_at = now_ts() + PERIOD_HOURS * 3600
+        asyncio.create_task(poller())
 
-    async def on_open_or_update(self, ev: Dict[str, Any]):
-        symbol = (ev.get("instId") or ev.get("symbol") or "").upper().replace("_", "-")
-        if not symbol:
-            return
-        side = side_label(ev.get("posSide") or ev.get("side") or "long")
-        lev = _f(ev.get("lever") or ev.get("leverage") or 0) or 0.0
-        entry = _f(ev.get("avgPx") or ev.get("avgPrice") or ev.get("entryPrice")) or 0.0
-        mark  = _f(ev.get("markPx") or ev.get("markPrice") or ev.get("px") or ev.get("last")) or entry
-        qty   = compute_base_qty(ev) or 0.0
-
-        # If size is ~0, treat as close
-        if qty <= SIZE_EPS:
-            await self.on_close({"instId": symbol, "markPx": mark})
-            return
-
-        # PnL: use feed if present, else compute
-        pnl = _f(ev.get("unrealizedPnl") or ev.get("uPnL") or ev.get("pnl"))
-        pnl_ratio = _f(ev.get("unrealizedPnlRatio") or ev.get("uPnLRatio") or ev.get("pnlRatio"))
-        if pnl is None or pnl_ratio is None:
-            # approximate pnl in quote
-            if side == "Long":
-                pnl = (mark - entry) * qty
-            else:
-                pnl = (entry - mark) * qty
-            notional = max(1e-12, entry * qty)
-            pnl_ratio = (pnl / notional)
-
-        pnl_pct = float(pnl_ratio) * 100.0 if abs(pnl_ratio) <= 1.0 else float(pnl_ratio)
-
-        prev = self.positions.get(symbol)
-        is_new = prev is None
-        self.positions[symbol] = Position(
-            symbol=symbol, side=side, lev=float(lev), qty=float(qty),
-            entry=float(entry), mark=float(mark), pnl=float(pnl), pnl_pct=float(pnl_pct),
-            notion_page_id=self.open_pages.get(norm_symbol(symbol))
-        )
-
-        # Notion
-        title = norm_symbol(symbol)
-        pid = self.open_pages.get(title)
-        if pid:
-            await self.notion.update_open(pid, qty=float(qty), entry=float(entry), mark=float(mark))
-        else:
-            await self.notion.create_open(symbol, side, float(lev), float(qty), float(entry), float(mark))
-            # refresh cache so we can link it
-            self.open_pages = await self.notion.query_open_pages()
-
-        # Discord buffer for "New Trades"
-        if is_new:
-            self.buffer_new.append({
-                "symbol": symbol, "side": side, "lev": float(lev),
-                "entry": float(entry), "pnl": float(pnl), "pnl_pct": float(pnl_pct),
-            })
-
-    async def on_close(self, ev: Dict[str, Any]):
-        symbol = (ev.get("instId") or ev.get("symbol") or "").upper().replace("_", "-")
-        mark = _f(ev.get("markPx") or ev.get("markPrice") or ev.get("px") or ev.get("last"))
-        if not symbol:
-            return
-        if symbol in self.positions:
-            # Notion close
-            title = norm_symbol(symbol)
-            pid = self.open_pages.get(title)
-            if pid:
-                await self.notion.close(pid, float(mark or self.positions[symbol].mark or self.positions[symbol].entry))
-            # remove locally
-            self.positions.pop(symbol, None)
-            # force a post (close + snapshot)
-            await self.maybe_post(force=True)
-
-    async def ws_loop(self):
+        # WS loop (auto reconnect)
         while True:
+            print(f"Connecting to BloFin WS… ({BLOFIN_WS})" if "openapi" in BLOFIN_WS else "Connecting to BloFin WS…")
             try:
-                print(f"Connecting to BloFin WS… ({WS_URL})")
-                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                    await ws.send(json.dumps(login_frame()))
-                    # (Optionally) verify login ack here if server echoes event
-                    await ws.send(json.dumps(sub_positions_frame()))
-                    await ws.send(json.dumps(sub_orders_frame()))
-                    print("✅ Connected & subscribed (orders/positions)")
+                async with websockets.connect(BLOFIN_WS, ping_interval=20, ping_timeout=20) as ws:
+                    await ws_login(ws)
+                    await ws_subscribe(ws)
 
-                    last_new_flush = 0.0
-
-                    async for raw in ws:
+                    # basic heartbeat
+                    last_seen = time.time()
+                    while True:
                         try:
-                            data = json.loads(raw)
-                        except Exception:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            # send ping frame (websockets lib does this automatically if ping_interval set)
                             continue
-                        if not isinstance(data, dict):
+
+                        last_seen = time.time()
+                        data = json.loads(raw)
+
+                        # login/subscribe acks
+                        if data.get("event") in ("login", "subscribe"):
                             continue
-                        arg = data.get("arg") or {}
-                        ch = arg.get("channel")
+
+                        # OKX-ish channel frame: {"arg":{"channel":"positions"},"data":[...]}
+                        arg = data.get("arg", {})
+                        ch = arg.get("channel") or data.get("channel")
+                        payload = data.get("data") or data.get("result") or []
+                        if not ch or not payload:
+                            continue
 
                         if ch == "positions":
-                            for ev in data.get("data", []):
-                                await self.on_open_or_update(ev)
-                            # when new trades buffered, coalesce briefly then post snapshot + new
-                            if self.buffer_new and (now_ts() - last_new_flush) > 2.0:
-                                await self.maybe_post(force=True)
-                                last_new_flush = now_ts()
-                            else:
-                                await self.maybe_post()
+                            normalized = [normalize_position_obj(x) for x in payload]
+                            await reconcile_positions(normalized, client, st, notion_props)
 
                         elif ch == "orders":
-                            # If you prefer, you can react to order-state closes here;
-                            # we rely on positions=0 to avoid duplicates.
-                            await self.maybe_post()
+                            # Some exchanges provide fills here. We still rely on positions diffing for truth.
+                            pass
 
             except Exception as e:
-                print("🔁 Reconnecting to BloFin WS in 2s…", repr(e))
-                await asyncio.sleep(2.0)
+                print(f"WS error: {e!r}")
+                print("🔁 Reconnecting to BloFin WS in 2s…", e)
+                await asyncio.sleep(2)
 
-# ============ ENTRYPOINT ============
+# ────────────────────────────────────────────────────────────────────────────────
+# RECONCILIATION (diff → actions)
+# ────────────────────────────────────────────────────────────────────────────────
+async def reconcile_positions(
+    positions: List[Dict[str, Any]],
+    client: httpx.AsyncClient,
+    st: Dict[str, Any],
+    notion_props: Dict[str, str],
+) -> None:
+    """
+    positions: list of normalized dicts (see normalize_position_obj)
+    We diff against st["positions"] and detect opens/closes & value changes.
+    """
+    # Build current map
+    cur: Dict[str, Dict[str, Any]] = {}
+    for p in positions:
+        sym = normalize_symbol(p["symbol"])
+        # net modes sometimes deliver duplicates (net pos only). Keep one.
+        # We merge so the latest entry/mark/pnl stays fresh.
+        if sym in cur:
+            # choose the one with bigger qty or fresher mark
+            if safe_float(p.get("qty", 0)) >= safe_float(cur[sym].get("qty", 0)):
+                cur[sym].update(p)
+        else:
+            cur[sym] = p
 
-async def run():
-    # Basic sanity logs
-    if not DISCORD_WEBHOOK:
-        print("WARNING: DISCORD_WEBHOOK_URL not set.")
-    if not (BLOFIN_API_KEY and BLOFIN_API_SECRET and BLOFIN_PASSPHRASE):
-        print("WARNING: Missing BloFin credentials.")
-    if not (NOTION_API_TOKEN and NOTION_DATABASE_ID):
-        print("WARNING: Missing Notion creds / DB id.")
+    prev: Dict[str, Any] = st.get("positions", {})
 
-    r = Runner()
-    await r.init_notion()
-    await r.ws_loop()
+    # OPEN: in cur and qty>0 but not in prev (or prev qty == 0)
+    for sym, p in cur.items():
+        qty = safe_float(p.get("qty", 0))
+        prev_qty = safe_float(prev.get(sym, {}).get("qty", 0))
+        if qty > 0 and prev_qty == 0:
+            # new open
+            line = format_new_trade_line(p)
+            await send_discord(line, client, st)
+            # Notion create/update
+            await notion_create_or_update(client, notion_props, p, st)
 
+    # CLOSE: in prev with qty>0 but not in cur (or qty==0)
+    for sym, pprev in prev.items():
+        prev_qty = safe_float(pprev.get("qty", 0))
+        cur_qty = safe_float(cur.get(sym, {}).get("qty", 0))
+        if prev_qty > 0 and cur_qty == 0:
+            pnl = safe_float(pprev.get("pnl", 0))
+            pnlp = safe_float(pprev.get("pnlPct", 0))
+            await send_discord(format_closed_trade_line(sym, pnl, pnlp), client, st)
+            # close in Notion
+            closing = dict(pprev)
+            closing["isOpen"] = False
+            await notion_create_or_update(client, notion_props, closing, st)
+
+    # UPDATE: for open positions, keep Notion row fresh (avg/mark/pnl)
+    for sym, p in cur.items():
+        if safe_float(p.get("qty", 0)) <= 0:
+            continue
+        # we only update Notion if something meaningful changed vs prev
+        prev_p = prev.get(sym, {})
+        changed = False
+        for k in ("entry", "mark", "pnl", "pnlPct"):
+            if abs(safe_float(p.get(k, 0)) - safe_float(prev_p.get(k, 0))) > 1e-10:
+                changed = True
+                break
+        if changed:
+            await notion_create_or_update(client, notion_props, p, st)
+
+    # Persist current
+    st["positions"] = cur
+    save_state(st)
+
+    # 6h snapshot to Discord (optional)
+    if PERIOD_HOURS > 0:
+        due = st.get("last_snapshot_at", 0) + PERIOD_HOURS * 3600
+        if time.time() >= due:
+            rows = []
+            for sym, p in cur.items():
+                rows.append({
+                    "symbol": sym,
+                    "side": p.get("side", "Long"),
+                    "lev": p.get("lev", 1),
+                    "entry": p.get("entry", 0.0),
+                    "pnl": p.get("pnl", 0.0),
+                    "pnlPct": p.get("pnlPct", 0.0),
+                })
+            msg = format_positions_table(rows)
+            await send_discord(msg, client, st)
+            st["last_snapshot_at"] = time.time()
+            save_state(st)
+
+# ────────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     try:
         asyncio.run(run())
